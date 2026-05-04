@@ -5080,3 +5080,4294 @@ export async function buildSplDistributionBatches(args: {
 
 
 
+
+
+Below is a complete monorepo scaffold (code) for:
+
+indexer/ (TypeScript; RPC WS logs + optional Helius webhook ingestion; Anchor event decoding)
+api/ (TypeScript; SIWS auth + tx-builder endpoints)
+notifier/ (TypeScript; cron + email/SMS templates; Postgres/Redis-backed queues)
+web/ (Next.js App Router; wallet adapter; SIWS sign-in; core flows)
+docker-compose.yml (Postgres + Redis; plus services so docker compose up brings up the stack)
+I’m basing:
+
+the webhook receiver on Helius’ webhook payload model + auth header support. 
+1
+SIWS message format on Phantom’s “Sign-In-With standards” docs. 
+2
+the Anchor event decoding approach on Anchor’s TS EventCoder/event decoding interface. 
+3
+the Next.js Solana integration skeleton on Solana’s Next.js frontend docs. 
+4
+Assumption: your Anchor program is already deployed and you have an IDL JSON for legacyvault available at ./idl/legacyvault.json in the repo root (or you can generate it from Anchor and copy it there).
+
+0) Repository layout
+text
+
+.
+├─ docker-compose.yml
+├─ .env.example
+├─ package.json
+├─ pnpm-workspace.yaml
+├─ tsconfig.base.json
+├─ idl/
+│  └─ legacyvault.json
+├─ db/
+│  ├─ package.json
+│  ├─ prisma/
+│  │  └─ schema.prisma
+│  └─ src/
+│     └─ client.ts
+├─ sdk/
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ index.ts
+│     └─ legacyvault/
+│        ├─ pdas.ts
+│        ├─ distribute.ts
+│        └─ tx.ts
+├─ api/
+│  ├─ Dockerfile
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ main.ts
+│     ├─ env.ts
+│     ├─ db.ts
+│     ├─ siws.ts
+│     ├─ auth.ts
+│     ├─ anchor.ts
+│     ├─ txbuild.ts
+│     └─ routes/
+│        ├─ health.ts
+│        ├─ auth.ts
+│        ├─ vaults.ts
+│        └─ tx.ts
+├─ indexer/
+│  ├─ Dockerfile
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ main.ts
+│     ├─ env.ts
+│     ├─ db.ts
+│     ├─ anchor.ts
+│     ├─ decode.ts
+│     ├─ ingestors/
+│     │  ├─ wsLogs.ts
+│     │  └─ heliusWebhook.ts
+│     └─ handlers/
+│        └─ eventsToDb.ts
+├─ notifier/
+│  ├─ Dockerfile
+│  ├─ package.json
+│  ├─ tsconfig.json
+│  └─ src/
+│     ├─ main.ts
+│     ├─ env.ts
+│     ├─ db.ts
+│     ├─ queue.ts
+│     ├─ scheduler.ts
+│     ├─ workers/
+│     │  ├─ emailWorker.ts
+│     │  └─ smsWorker.ts
+│     └─ templates/
+│        ├─ email.ts
+│        └─ sms.ts
+└─ web/
+   ├─ Dockerfile
+   ├─ package.json
+   ├─ next.config.mjs
+   ├─ tsconfig.json
+   └─ src/
+      ├─ app/
+      │  ├─ layout.tsx
+      │  ├─ page.tsx
+      │  ├─ signin/page.tsx
+      │  ├─ dashboard/page.tsx
+      │  └─ vault/[vault]/page.tsx
+      ├─ components/
+      │  ├─ WalletProviders.tsx
+      │  ├─ Navbar.tsx
+      │  └─ RequireAuth.tsx
+      └─ lib/
+         ├─ env.ts
+         ├─ api.ts
+         ├─ auth.ts
+         └─ solana.ts
+1) Root config
+package.json
+JSON
+
+{
+  "name": "legacyvault-monorepo",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "db",
+    "sdk",
+    "api",
+    "indexer",
+    "notifier",
+    "web"
+  ],
+  "scripts": {
+    "db:generate": "pnpm -C db prisma generate",
+    "db:migrate": "pnpm -C db prisma migrate dev",
+    "dev:api": "pnpm -C api dev",
+    "dev:indexer": "pnpm -C indexer dev",
+    "dev:notifier": "pnpm -C notifier dev",
+    "dev:web": "pnpm -C web dev",
+    "dev": "pnpm -r --parallel dev"
+  }
+}
+pnpm-workspace.yaml
+YAML
+
+packages:
+  - "db"
+  - "sdk"
+  - "api"
+  - "indexer"
+  - "notifier"
+  - "web"
+tsconfig.base.json
+JSON
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true
+  }
+}
+.env.example
+Bash
+
+# --- shared ---
+NODE_ENV=development
+
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/legacyvault?schema=public
+REDIS_URL=redis://localhost:6379
+
+SOLANA_CLUSTER=devnet
+SOLANA_RPC_URL=https://api.devnet.solana.com
+LEGACYVAULT_PROGRAM_ID=LeGaCyVaULt11111111111111111111111111111
+
+# --- indexer ---
+INDEXER_HTTP_PORT=8787
+INDEXER_WS_COMMITMENT=confirmed
+INDEXER_ENABLE_WS_LOGS=true
+INDEXER_ENABLE_HELIUS_WEBHOOK=false
+HELIUS_WEBHOOK_AUTH=replace-me-secret
+
+# --- api ---
+API_HTTP_PORT=8788
+API_JWT_SECRET=replace-me-jwt-secret
+API_DOMAIN=localhost:3000
+API_ORIGIN=http://localhost:3000
+API_SESSION_TTL_SECS=604800
+
+# optional: used for tx builder convenience
+API_DEFAULT_VAULT_ID_START=1
+
+# --- notifier ---
+NOTIFIER_HTTP_PORT=8789
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=demo
+SMTP_PASS=demo
+EMAIL_FROM="LegacyVault <noreply@legacyvault.example>"
+
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM_NUMBER=
+
+# --- web ---
+NEXT_PUBLIC_API_BASE=http://localhost:8788
+NEXT_PUBLIC_SOLANA_RPC_URL=https://api.devnet.solana.com
+NEXT_PUBLIC_LEGACYVAULT_PROGRAM_ID=LeGaCyVaULt11111111111111111111111111111
+NEXT_PUBLIC_DOMAIN=localhost:3000
+2) docker-compose (Postgres + Redis + services)
+docker-compose.yml
+YAML
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: legacyvault
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./api
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8788:8788"
+
+  indexer:
+    build: ./indexer
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8787:8787"
+
+  notifier:
+    build: ./notifier
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8789:8789"
+
+  web:
+    build: ./web
+    env_file: .env
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+Put your real environment in a local .env file (copy from .env.example).
+
+3) Database package (db/) — Prisma schema + client
+db/package.json
+JSON
+
+{
+  "name": "@legacyvault/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prisma": "prisma",
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0",
+    "typescript": "^5.6.3"
+  }
+}
+db/prisma/schema.prisma
+prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  wallet    String   @unique
+  createdAt DateTime @default(now())
+  sessions  Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  jti       String   @unique
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+}
+
+model Vault {
+  id              String   @id @default(cuid())
+  vaultPubkey     String   @unique
+  ownerWallet     String
+  vaultIdU64      String?  // stored as string for safety
+  status          String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  guardians       Guardian[]
+  beneficiaries   Beneficiary[]
+  unlockSessions  UnlockSession[]
+  subscriptions   Subscription[]
+}
+
+model Guardian {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  guardian    String
+  role        String
+  active      Boolean  @default(true)
+  addedAt     DateTime @default(now())
+
+  @@unique([vaultId, guardian])
+}
+
+model Beneficiary {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  beneficiary String
+  shareBps    Int
+  label       String?
+  active      Boolean  @default(true)
+  addedAt     DateTime @default(now())
+
+  @@unique([vaultId, beneficiary])
+}
+
+model UnlockSession {
+  id              String   @id @default(cuid())
+  unlockPubkey     String   @unique
+  vaultId          String
+  vault            Vault    @relation(fields: [vaultId], references: [id])
+
+  nonceU64         String
+  status           String
+  initiatedBy      String
+  initiatedAtUnix  BigInt
+  approvals        Int
+  threshold        Int
+  approvedAtUnix   BigInt?
+  executableAtUnix BigInt?
+
+  approvalsRows    Approval[]
+  distSol          DistributionSolSession?
+  distSpl          DistributionSplSession[]
+  dispute          DisputeCase?
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Approval {
+  id             String   @id @default(cuid())
+  unlockId        String
+  unlock          UnlockSession @relation(fields: [unlockId], references: [id])
+  guardian        String
+  approvedAtUnix  BigInt
+
+  @@unique([unlockId, guardian])
+}
+
+model DistributionSolSession {
+  id                String   @id @default(cuid())
+  unlockId           String   @unique
+  unlock             UnlockSession @relation(fields: [unlockId], references: [id])
+
+  totalDistributable BigInt
+  paidTotal          BigInt
+  cursor             Int
+  done               Boolean
+
+  updatedAt          DateTime @updatedAt
+}
+
+model DistributionSplSession {
+  id           String   @id @default(cuid())
+  unlockId      String
+  unlock        UnlockSession @relation(fields: [unlockId], references: [id])
+
+  mint         String
+  totalBalance BigInt
+  paidTotal    BigInt
+  cursor       Int
+  done         Boolean
+
+  @@unique([unlockId, mint])
+}
+
+model DisputeCase {
+  id            String   @id @default(cuid())
+  unlockId       String   @unique
+  unlock         UnlockSession @relation(fields: [unlockId], references: [id])
+
+  status        String
+  openedBy      String
+  openedAtUnix  BigInt
+  noteHashHex   String
+
+  resolvedAt    DateTime?
+}
+
+model Subscription {
+  id            String   @id @default(cuid())
+  vaultId       String
+  vault         Vault    @relation(fields: [vaultId], references: [id])
+  planId        Int
+  validUntilUnix BigInt
+  updatedAt     DateTime @updatedAt
+
+  @@unique([vaultId, planId])
+}
+
+model GuardianProfile {
+  id           String   @id @default(cuid())
+  guardian     String   @unique
+  displayName  String?
+  websiteUri   String?
+  kycLevel     Int      @default(0)
+  active       Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
+}
+
+model GuardianBond {
+  id        String   @id @default(cuid())
+  guardian  String   @unique
+  amount    BigInt
+  locked    Boolean
+  updatedAt DateTime @updatedAt
+}
+
+model EventLog {
+  id         String   @id @default(cuid())
+  signature  String   @unique
+  slot       BigInt
+  programId  String
+  eventName  String
+  dataJson   Json
+  blockTime  BigInt?
+  createdAt  DateTime @default(now())
+}
+db/src/client.ts
+TypeScript
+
+import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient();
+4) SDK package (sdk/) — reuse tx builders/distribution builders
+sdk/package.json
+JSON
+
+{
+  "name": "@legacyvault/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.4",
+    "@solana/spl-token": "^0.4.9",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
+sdk/tsconfig.json
+JSON
+
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist" },
+  "include": ["src"]
+}
+sdk/src/index.ts
+TypeScript
+
+export * as legacyvault from "./legacyvault/tx";
+export * as legacyvaultPdas from "./legacyvault/pdas";
+export * as legacyvaultDistribute from "./legacyvault/distribute";
+sdk/src/legacyvault/pdas.ts
+TypeScript
+
+// (same as earlier; included here as-is)
+import { PublicKey } from "@solana/web3.js";
+
+export const SEEDS = {
+  CONFIG: Buffer.from("config"),
+  VAULT: Buffer.from("vault"),
+  VAULT_AUTH: Buffer.from("vault_auth"),
+  INDEX: Buffer.from("index"),
+  GUARDIAN: Buffer.from("guardian"),
+  BENEFICIARY: Buffer.from("beneficiary"),
+  DELEGATE: Buffer.from("delegate"),
+  ASSET_RULE: Buffer.from("asset_rule"),
+  UNLOCK: Buffer.from("unlock"),
+  APPROVAL: Buffer.from("approval"),
+  DIST_SOL: Buffer.from("dist_sol"),
+  DIST_SPL: Buffer.from("dist_spl"),
+  DISPUTE: Buffer.from("dispute"),
+  SUB: Buffer.from("sub"),
+  G_PROFILE: Buffer.from("g_profile"),
+  G_BOND: Buffer.from("g_bond")
+};
+
+export function u64LE(x: bigint) {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64LE(x);
+  return b;
+}
+
+export function configPda(programId: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.CONFIG], programId);
+}
+export function vaultPda(programId: PublicKey, owner: PublicKey, vaultId: bigint) {
+  return PublicKey.findProgramAddressSync([SEEDS.VAULT, owner.toBuffer(), u64LE(vaultId)], programId);
+}
+export function vaultAuthPda(programId: PublicKey, vault: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.VAULT_AUTH, vault.toBuffer()], programId);
+}
+export function indexPda(programId: PublicKey, vault: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.INDEX, vault.toBuffer()], programId);
+}
+export function guardianEntryPda(programId: PublicKey, vault: PublicKey, guardian: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.GUARDIAN, vault.toBuffer(), guardian.toBuffer()], programId);
+}
+export function beneficiaryEntryPda(programId: PublicKey, vault: PublicKey, beneficiary: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.BENEFICIARY, vault.toBuffer(), beneficiary.toBuffer()], programId);
+}
+export function unlockPda(programId: PublicKey, vault: PublicKey, nonce: bigint) {
+  return PublicKey.findProgramAddressSync([SEEDS.UNLOCK, vault.toBuffer(), u64LE(nonce)], programId);
+}
+export function approvalPda(programId: PublicKey, unlock: PublicKey, guardian: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.APPROVAL, unlock.toBuffer(), guardian.toBuffer()], programId);
+}
+export function distSolPda(programId: PublicKey, unlock: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.DIST_SOL, unlock.toBuffer()], programId);
+}
+export function distSplPda(programId: PublicKey, unlock: PublicKey, mint: PublicKey) {
+  return PublicKey.findProgramAddressSync([SEEDS.DIST_SPL, unlock.toBuffer(), mint.toBuffer()], programId);
+}
+sdk/src/legacyvault/tx.ts
+TypeScript
+
+import { Program } from "@coral-xyz/anchor";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import BN from "bn.js";
+import {
+  approvalPda, beneficiaryEntryPda, configPda, distSolPda, distSplPda,
+  guardianEntryPda, indexPda, unlockPda, vaultAuthPda, vaultPda
+} from "./pdas";
+
+export async function ixCreateVault(args: {
+  program: Program;
+  owner: PublicKey;
+  vaultId: bigint;
+  heartbeatSecs: number;
+  inactivitySecs: number;
+  timelockSecs: number;
+  panicEnabled: boolean;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [vault] = vaultPda(args.program.programId, args.owner, args.vaultId);
+  const [vaultAuth] = vaultAuthPda(args.program.programId, vault);
+  const [index] = indexPda(args.program.programId, vault);
+
+  const cfgAcc: any = await args.program.account.globalConfig.fetch(cfg);
+  const treasury = cfgAcc.treasury as PublicKey;
+
+  return args.program.methods
+    .createVault(
+      new BN(args.vaultId.toString()),
+      args.heartbeatSecs,
+      args.inactivitySecs,
+      args.timelockSecs,
+      args.panicEnabled
+    )
+    .accounts({
+      config: cfg,
+      vault,
+      vaultAuth,
+      index,
+      owner: args.owner,
+      treasury,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixAddGuardian(args: {
+  program: Program;
+  owner: PublicKey;
+  vault: PublicKey;
+  guardian: PublicKey;
+  role: number;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [index] = indexPda(args.program.programId, args.vault);
+  const [ge] = guardianEntryPda(args.program.programId, args.vault, args.guardian);
+
+  return args.program.methods
+    .addGuardian(args.role)
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      index,
+      guardianEntry: ge,
+      guardian: args.guardian,
+      owner: args.owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixAddBeneficiary(args: {
+  program: Program;
+  owner: PublicKey;
+  vault: PublicKey;
+  beneficiary: PublicKey;
+  shareBps: number;
+  label16: number[];
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [index] = indexPda(args.program.programId, args.vault);
+  const [be] = beneficiaryEntryPda(args.program.programId, args.vault, args.beneficiary);
+
+  return args.program.methods
+    .addBeneficiary(args.shareBps, args.label16)
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      index,
+      beneficiaryEntry: be,
+      beneficiary: args.beneficiary,
+      owner: args.owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixSetGuardianThreshold(args: {
+  program: Program;
+  owner: PublicKey;
+  vault: PublicKey;
+  threshold: number;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [index] = indexPda(args.program.programId, args.vault);
+
+  return args.program.methods
+    .setGuardianThreshold(args.threshold)
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      index,
+      owner: args.owner
+    })
+    .instruction();
+}
+
+export async function ixDepositSpl(args: {
+  program: Program;
+  owner: PublicKey;
+  vault: PublicKey;
+  mint: PublicKey;
+  amount: BN;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [vaultAuth] = vaultAuthPda(args.program.programId, args.vault);
+
+  const ownerAta = getAssociatedTokenAddressSync(args.mint, args.owner);
+  const vaultAta = getAssociatedTokenAddressSync(args.mint, vaultAuth, true);
+
+  return args.program.methods
+    .depositSpl(args.amount)
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      vaultAuth,
+      mint: args.mint,
+      owner: args.owner,
+      ownerAta,
+      vaultAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+      systemProgram: SystemProgram.programId,
+      rent: PublicKey.default
+    })
+    .instruction();
+}
+
+export async function ixInitiateUnlock(args: {
+  program: Program;
+  vault: PublicKey;
+  guardian: PublicKey;
+  nonce: bigint;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [ge] = guardianEntryPda(args.program.programId, args.vault, args.guardian);
+  const [unlock] = unlockPda(args.program.programId, args.vault, args.nonce);
+
+  return args.program.methods
+    .initiateUnlock()
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      guardianEntry: ge,
+      unlock,
+      guardian: args.guardian,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixApproveUnlock(args: {
+  program: Program;
+  vault: PublicKey;
+  unlock: PublicKey;
+  guardian: PublicKey;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [ge] = guardianEntryPda(args.program.programId, args.vault, args.guardian);
+  const [approval] = approvalPda(args.program.programId, args.unlock, args.guardian);
+
+  return args.program.methods
+    .approveUnlock()
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      guardianEntry: ge,
+      unlock: args.unlock,
+      approval,
+      guardian: args.guardian,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixInitDistSol(args: {
+  program: Program;
+  vault: PublicKey;
+  unlock: PublicKey;
+  payer: PublicKey;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [distSol] = distSolPda(args.program.programId, args.unlock);
+
+  return args.program.methods
+    .initDistributionSolSession()
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      unlock: args.unlock,
+      distSol,
+      payer: args.payer,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+
+export async function ixInitDistSpl(args: {
+  program: Program;
+  vault: PublicKey;
+  unlock: PublicKey;
+  mint: PublicKey;
+  payer: PublicKey;
+}) {
+  const [cfg] = configPda(args.program.programId);
+  const [vaultAuth] = vaultAuthPda(args.program.programId, args.vault);
+  const [distSpl] = distSplPda(args.program.programId, args.unlock, args.mint);
+  const vaultAta = getAssociatedTokenAddressSync(args.mint, vaultAuth, true);
+
+  return args.program.methods
+    .initDistributionSplSession()
+    .accounts({
+      config: cfg,
+      vault: args.vault,
+      unlock: args.unlock,
+      vaultAuth,
+      mint: args.mint,
+      distSpl,
+      vaultAta,
+      payer: args.payer,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+}
+sdk/src/legacyvault/distribute.ts
+TypeScript
+
+import { Program } from "@coral-xyz/anchor";
+import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { beneficiaryEntryPda, configPda, distSolPda, distSplPda, indexPda, vaultAuthPda } from "./pdas";
+
+export async function buildSolDistributionBatches(args: {
+  program: Program;
+  vault: PublicKey;
+  unlock: PublicKey;
+  batchSize: number;
+}): Promise<TransactionInstruction[]> {
+  const [cfg] = configPda(args.program.programId);
+  const [indexAddr] = indexPda(args.program.programId, args.vault);
+  const [distSol] = distSolPda(args.program.programId, args.unlock);
+
+  const index: any = await args.program.account.vaultIndex.fetch(indexAddr);
+  const beneficiaries: PublicKey[] = index.beneficiaries;
+
+  const ixs: TransactionInstruction[] = [];
+
+  for (let start = 0; start < beneficiaries.length; start += args.batchSize) {
+    const end = Math.min(start + args.batchSize, beneficiaries.length);
+    const slice = beneficiaries.slice(start, end);
+
+    const remaining = [];
+    for (const b of slice) {
+      const [be] = beneficiaryEntryPda(args.program.programId, args.vault, b);
+      remaining.push({ pubkey: be, isSigner: false, isWritable: false });
+      remaining.push({ pubkey: b, isSigner: false, isWritable: true });
+    }
+
+    const ix = await args.program.methods
+      .executeDistributionSolBatch(start, end - start)
+      .accounts({
+        config: cfg,
+        vault: args.vault,
+        unlock: args.unlock,
+        index: indexAddr,
+        distSol,
+        systemProgram: SystemProgram.programId
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+
+    ixs.push(ix);
+  }
+
+  return ixs;
+}
+
+export async function buildSplDistributionBatches(args: {
+  program: Program;
+  vault: PublicKey;
+  unlock: PublicKey;
+  mint: PublicKey;
+  batchSize: number;
+}): Promise<TransactionInstruction[]> {
+  const [cfg] = configPda(args.program.programId);
+  const [indexAddr] = indexPda(args.program.programId, args.vault);
+  const [vaultAuth] = vaultAuthPda(args.program.programId, args.vault);
+  const [distSpl] = distSplPda(args.program.programId, args.unlock, args.mint);
+  const vaultAta = getAssociatedTokenAddressSync(args.mint, vaultAuth, true);
+
+  const index: any = await args.program.account.vaultIndex.fetch(indexAddr);
+  const beneficiaries: PublicKey[] = index.beneficiaries;
+
+  const ixs: TransactionInstruction[] = [];
+
+  for (let start = 0; start < beneficiaries.length; start += args.batchSize) {
+    const end = Math.min(start + args.batchSize, beneficiaries.length);
+    const slice = beneficiaries.slice(start, end);
+
+    const remaining = [];
+    for (const b of slice) {
+      const [be] = beneficiaryEntryPda(args.program.programId, args.vault, b);
+      const ata = getAssociatedTokenAddressSync(args.mint, b);
+      remaining.push({ pubkey: be, isSigner: false, isWritable: false });
+      remaining.push({ pubkey: b, isSigner: false, isWritable: false });
+      remaining.push({ pubkey: ata, isSigner: false, isWritable: true });
+    }
+
+    const ix = await args.program.methods
+      .executeDistributionSplBatch(start, end - start)
+      .accounts({
+        config: cfg,
+        vault: args.vault,
+        vaultAuth,
+        unlock: args.unlock,
+        index: indexAddr,
+        mint: args.mint,
+        distSpl,
+        vaultAta,
+        tokenProgram: TOKEN_PROGRAM_ID
+      })
+      .remainingAccounts(remaining)
+      .instruction();
+
+    ixs.push(ix);
+  }
+
+  return ixs;
+}
+5) Indexer service (indexer/)
+Helius webhook basics + auth header pattern are from Helius docs. 
+1
+
+Anchor TS event decoding interface reference is from Anchor docs. 
+3
+
+indexer/Dockerfile
+Dockerfile
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* ./
+RUN corepack enable && pnpm install --prod
+COPY . .
+CMD ["pnpm", "start"]
+indexer/package.json
+JSON
+
+{
+  "name": "indexer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --loader ts-node/esm src/main.ts",
+    "start": "node --loader ts-node/esm src/main.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@legacyvault/db": "workspace:*",
+    "@solana/web3.js": "^1.95.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
+indexer/tsconfig.json
+JSON
+
+{
+  "extends": "../tsconfig.base.json",
+  "include": ["src"]
+}
+indexer/src/env.ts
+TypeScript
+
+import "dotenv/config";
+import { z } from "zod";
+
+const Env = z.object({
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  SOLANA_RPC_URL: z.string(),
+  LEGACYVAULT_PROGRAM_ID: z.string(),
+
+  INDEXER_HTTP_PORT: z.string().default("8787"),
+  INDEXER_ENABLE_WS_LOGS: z.string().default("true"),
+  INDEXER_ENABLE_HELIUS_WEBHOOK: z.string().default("false"),
+  HELIUS_WEBHOOK_AUTH: z.string().optional()
+});
+
+export const env = Env.parse(process.env);
+indexer/src/db.ts
+TypeScript
+
+export { prisma } from "@legacyvault/db";
+indexer/src/anchor.ts
+TypeScript
+
+import { AnchorProvider, BorshCoder, Program } from "@coral-xyz/anchor";
+import { Connection, PublicKey } from "@solana/web3.js";
+import idl from "../../idl/legacyvault.json" assert { type: "json" };
+import { env } from "./env";
+
+export const connection = new Connection(env.SOLANA_RPC_URL, "confirmed");
+export const programId = new PublicKey(env.LEGACYVAULT_PROGRAM_ID);
+
+// provider wallet is never used for signing here; indexer only decodes
+export const provider = new AnchorProvider(connection, {} as any, { commitment: "confirmed" });
+
+export const coder = new BorshCoder(idl as any);
+export const program = new Program(idl as any, programId, provider);
+indexer/src/decode.ts
+TypeScript
+
+import { EventParser } from "@coral-xyz/anchor";
+import { programId, program } from "./anchor";
+
+export function decodeAnchorEvents(logs: string[]) {
+  const parser = new EventParser(programId, program.coder);
+  const events: Array<{ name: string; data: any }> = [];
+  parser.parseLogs(logs, (evt) => {
+    events.push({ name: evt.name, data: evt.data });
+  });
+  return events;
+}
+indexer/src/handlers/eventsToDb.ts
+TypeScript
+
+import { prisma } from "../db";
+
+export async function persistEvents(args: {
+  signature: string;
+  slot: bigint;
+  programId: string;
+  blockTime?: bigint | null;
+  events: Array<{ name: string; data: any }>;
+}) {
+  // Store one row per tx signature (simple); or split per event if preferred.
+  await prisma.eventLog.upsert({
+    where: { signature: args.signature },
+    create: {
+      signature: args.signature,
+      slot: args.slot,
+      programId: args.programId,
+      eventName: args.events.map(e => e.name).join(","),
+      dataJson: args.events as any,
+      blockTime: args.blockTime ?? null
+    },
+    update: {
+      slot: args.slot,
+      eventName: args.events.map(e => e.name).join(","),
+      dataJson: args.events as any,
+      blockTime: args.blockTime ?? null
+    }
+  });
+
+  // Optional: build derived state (Vaults/UnlockSessions) here.
+  // In production, you’d map each event type -> upserts.
+}
+indexer/src/ingestors/wsLogs.ts
+TypeScript
+
+import { connection, programId } from "../anchor";
+import { decodeAnchorEvents } from "../decode";
+import { persistEvents } from "../handlers/eventsToDb";
+
+export async function startWsLogsIngestor() {
+  console.log("[indexer] starting WS logs subscription");
+
+  connection.onLogs(programId, async (logInfo, ctx) => {
+    try {
+      const events = decodeAnchorEvents(logInfo.logs);
+      if (events.length === 0) return;
+
+      await persistEvents({
+        signature: logInfo.signature,
+        slot: BigInt(ctx.slot),
+        programId: programId.toBase58(),
+        blockTime: null,
+        events
+      });
+    } catch (e) {
+      console.error("[indexer][wsLogs] error", e);
+    }
+  }, "confirmed");
+}
+indexer/src/ingestors/heliusWebhook.ts
+TypeScript
+
+import express from "express";
+import { env } from "../env";
+import { decodeAnchorEvents } from "../decode";
+import { persistEvents } from "../handlers/eventsToDb";
+import { programId } from "../anchor";
+
+/**
+ * Helius webhooks can be configured with an authHeader that Helius includes
+ * in deliveries; validate it here. <!--citation:5-->
+ */
+export function heliusWebhookRouter() {
+  const router = express.Router();
+
+  router.post("/helius", express.json({ limit: "2mb" }), async (req, res) => {
+    try {
+      const auth = req.headers["authorization"];
+      if (env.HELIUS_WEBHOOK_AUTH && auth !== env.HELIUS_WEBHOOK_AUTH) {
+        return res.status(401).json({ ok: false });
+      }
+
+      // Enhanced webhook payload is typically an array of tx objects
+      const payload = req.body;
+      const txs = Array.isArray(payload) ? payload : [payload];
+
+      for (const tx of txs) {
+        const signature = tx?.signature ?? tx?.transaction?.signatures?.[0];
+        const logs: string[] = tx?.transaction?.meta?.logMessages ?? tx?.meta?.logMessages ?? [];
+        if (!signature || logs.length === 0) continue;
+
+        // only keep txs that actually mention the program id in logs (cheap filter)
+        if (!logs.some(l => l.includes(programId.toBase58()))) continue;
+
+        const events = decodeAnchorEvents(logs);
+        if (events.length === 0) continue;
+
+        await persistEvents({
+          signature,
+          slot: BigInt(tx?.slot ?? 0),
+          programId: programId.toBase58(),
+          blockTime: tx?.blockTime ? BigInt(tx.blockTime) : null,
+          events
+        });
+      }
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("[indexer][heliusWebhook] error", e);
+      res.status(500).json({ ok: false });
+    }
+  });
+
+  return router;
+}
+indexer/src/main.ts
+TypeScript
+
+import express from "express";
+import { env } from "./env";
+import { startWsLogsIngestor } from "./ingestors/wsLogs";
+import { heliusWebhookRouter } from "./ingestors/heliusWebhook";
+
+async function main() {
+  const app = express();
+
+  app.get("/health", (_, res) => res.json({ ok: true }));
+
+  if (env.INDEXER_ENABLE_HELIUS_WEBHOOK === "true") {
+    app.use("/webhooks", heliusWebhookRouter());
+  }
+
+  app.listen(Number(env.INDEXER_HTTP_PORT), () => {
+    console.log(`[indexer] http listening on :${env.INDEXER_HTTP_PORT}`);
+  });
+
+  if (env.INDEXER_ENABLE_WS_LOGS === "true") {
+    await startWsLogsIngestor();
+  }
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+6) API service (api/) — SIWS + tx-builder
+SIWS message format details are taken from Phantom’s SIW docs. 
+2
+
+api/Dockerfile
+Dockerfile
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* ./
+RUN corepack enable && pnpm install --prod
+COPY . .
+CMD ["pnpm", "start"]
+api/package.json
+JSON
+
+{
+  "name": "api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --loader ts-node/esm src/main.ts",
+    "start": "node --loader ts-node/esm src/main.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@legacyvault/db": "workspace:*",
+    "@legacyvault/sdk": "workspace:*",
+    "@solana/web3.js": "^1.95.4",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "tweetnacl": "^1.0.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
+api/src/env.ts
+TypeScript
+
+import "dotenv/config";
+import { z } from "zod";
+
+const Env = z.object({
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  SOLANA_RPC_URL: z.string(),
+  LEGACYVAULT_PROGRAM_ID: z.string(),
+
+  API_HTTP_PORT: z.string().default("8788"),
+  API_JWT_SECRET: z.string(),
+  API_DOMAIN: z.string(),
+  API_ORIGIN: z.string(),
+  API_SESSION_TTL_SECS: z.string().default("604800")
+});
+
+export const env = Env.parse(process.env);
+api/src/db.ts
+TypeScript
+
+export { prisma } from "@legacyvault/db";
+api/src/siws.ts
+TypeScript
+
+import { env } from "./env";
+
+/**
+ * Minimal SIWS-style message builder.
+ * Phantom documents the canonical “domain wants you to sign in…” pattern and fields
+ * like uri, nonce, issued-at. <!--citation:2-->
+ */
+export function buildSiwsMessage(args: {
+  domain: string;
+  address: string;
+  statement: string;
+  uri: string;
+  version: string;      // "1"
+  chainId: string;      // e.g., "solana:devnet"
+  nonce: string;
+  issuedAt: string;     // ISO string
+  expirationTime?: string;
+}): string {
+  const lines: string[] = [];
+
+  lines.push(`${args.domain} wants you to sign in with your Solana account:`);
+  lines.push(`${args.address}`);
+  lines.push("");
+  lines.push(args.statement);
+  lines.push("");
+  lines.push(`URI: ${args.uri}`);
+  lines.push(`Version: ${args.version}`);
+  lines.push(`Chain ID: ${args.chainId}`);
+  lines.push(`Nonce: ${args.nonce}`);
+  lines.push(`Issued At: ${args.issuedAt}`);
+  if (args.expirationTime) lines.push(`Expiration Time: ${args.expirationTime}`);
+
+  return lines.join("\n");
+}
+
+export function defaultStatement() {
+  return "Sign in to LegacyVault to manage your vaults and build transactions.";
+}
+api/src/auth.ts
+TypeScript
+
+import jwt from "jsonwebtoken";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import { PublicKey } from "@solana/web3.js";
+import { env } from "./env";
+import { prisma } from "./db";
+
+export function createJwt(args: { wallet: string; jti: string; expSec: number }) {
+  return jwt.sign(
+    { sub: args.wallet, jti: args.jti },
+    env.API_JWT_SECRET,
+    { expiresIn: args.expSec }
+  );
+}
+
+export function verifyJwt(token: string): { wallet: string; jti: string } {
+  const decoded = jwt.verify(token, env.API_JWT_SECRET) as any;
+  return { wallet: decoded.sub, jti: decoded.jti };
+}
+
+export async function verifySignature(args: { message: string; signatureBase58: string; publicKey: string }) {
+  const sig = bs58.decode(args.signatureBase58);
+  const pub = new PublicKey(args.publicKey);
+  const ok = nacl.sign.detached.verify(
+    new TextEncoder().encode(args.message),
+    sig,
+    pub.toBytes()
+  );
+  return ok;
+}
+
+export async function getOrCreateUser(wallet: string) {
+  return prisma.user.upsert({
+    where: { wallet },
+    create: { wallet },
+    update: {}
+  });
+}
+
+export async function createSession(wallet: string, ttlSecs: number) {
+  const user = await getOrCreateUser(wallet);
+  const jti = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + ttlSecs * 1000);
+
+  await prisma.session.create({
+    data: { userId: user.id, jti, expiresAt }
+  });
+
+  return { jti, expiresAt };
+}
+
+export async function requireAuth(req: any, res: any, next: any) {
+  try {
+    const h = req.headers["authorization"];
+    if (!h?.startsWith("Bearer ")) return res.status(401).json({ ok: false });
+    const token = h.slice("Bearer ".length);
+    const { wallet, jti } = verifyJwt(token);
+
+    const session = await prisma.session.findUnique({ where: { jti } });
+    if (!session || session.expiresAt < new Date()) return res.status(401).json({ ok: false });
+
+    req.user = { wallet, jti };
+    next();
+  } catch {
+    res.status(401).json({ ok: false });
+  }
+}
+api/src/anchor.ts
+TypeScript
+
+import { AnchorProvider, Program } from "@coral-xyz/anchor";
+import { Connection, PublicKey } from "@solana/web3.js";
+import idl from "../../idl/legacyvault.json" assert { type: "json" };
+import { env } from "./env";
+
+export const connection = new Connection(env.SOLANA_RPC_URL, "confirmed");
+export const programId = new PublicKey(env.LEGACYVAULT_PROGRAM_ID);
+
+// API never signs; wallet is a dummy
+export const provider = new AnchorProvider(connection, {} as any, { commitment: "confirmed" });
+export const program = new Program(idl as any, programId, provider);
+api/src/txbuild.ts
+TypeScript
+
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+
+export async function buildUnsignedTxBase64(args: {
+  connection: Connection;
+  feePayer: PublicKey;
+  ixs: any[];
+}) {
+  const { blockhash, lastValidBlockHeight } = await args.connection.getLatestBlockhash("confirmed");
+
+  const tx = new Transaction();
+  tx.feePayer = args.feePayer;
+  tx.recentBlockhash = blockhash;
+  tx.add(...args.ixs);
+
+  const b64 = tx.serialize({ requireAllSignatures: false }).toString("base64");
+  return { txBase64: b64, blockhash, lastValidBlockHeight };
+}
+api/src/routes/auth.ts
+TypeScript
+
+import express from "express";
+import { z } from "zod";
+import { buildSiwsMessage, defaultStatement } from "../siws";
+import { createSession, createJwt, verifySignature } from "../auth";
+import { env } from "../env";
+
+export const authRouter = express.Router();
+
+const NonceResp = z.object({ nonce: z.string(), issuedAt: z.string(), message: z.string() });
+
+authRouter.post("/nonce", express.json(), async (req, res) => {
+  const nonce = crypto.randomUUID().replace(/-/g, "");
+  const issuedAt = new Date().toISOString();
+
+  // client will rebuild message too; server returns canonical message to reduce mismatch
+  const message = buildSiwsMessage({
+    domain: env.API_DOMAIN,
+    address: "WALLET_ADDRESS_PLACEHOLDER",
+    statement: defaultStatement(),
+    uri: env.API_ORIGIN,
+    version: "1",
+    chainId: "solana:devnet",
+    nonce,
+    issuedAt
+  });
+
+  res.json(NonceResp.parse({ nonce, issuedAt, message }));
+});
+
+authRouter.post("/verify", express.json(), async (req, res) => {
+  const Body = z.object({
+    wallet: z.string(),
+    message: z.string(),
+    signatureBase58: z.string(),
+    nonce: z.string(),
+    issuedAt: z.string()
+  });
+  const body = Body.parse(req.body);
+
+  // verify signature
+  const ok = await verifySignature({
+    message: body.message,
+    signatureBase58: body.signatureBase58,
+    publicKey: body.wallet
+  });
+  if (!ok) return res.status(401).json({ ok: false });
+
+  // create session
+  const ttl = Number(env.API_SESSION_TTL_SECS);
+  const { jti, expiresAt } = await createSession(body.wallet, ttl);
+  const token = createJwt({ wallet: body.wallet, jti, expSec: ttl });
+
+  res.json({ ok: true, token, expiresAt: expiresAt.toISOString() });
+});
+api/src/routes/vaults.ts
+TypeScript
+
+import express from "express";
+import { prisma } from "../db";
+import { requireAuth } from "../auth";
+
+export const vaultsRouter = express.Router();
+
+vaultsRouter.get("/", requireAuth, async (req: any, res) => {
+  const wallet = req.user.wallet;
+  const vaults = await prisma.vault.findMany({ where: { ownerWallet: wallet }, orderBy: { createdAt: "desc" } });
+  res.json({ ok: true, vaults });
+});
+
+vaultsRouter.get("/:vaultPubkey", requireAuth, async (req: any, res) => {
+  const v = await prisma.vault.findUnique({ where: { vaultPubkey: req.params.vaultPubkey } });
+  if (!v) return res.status(404).json({ ok: false });
+  if (v.ownerWallet !== req.user.wallet) return res.status(403).json({ ok: false });
+  res.json({ ok: true, vault: v });
+});
+api/src/routes/tx.ts
+TypeScript
+
+import express from "express";
+import { z } from "zod";
+import { PublicKey } from "@solana/web3.js";
+import BN from "bn.js";
+import { requireAuth } from "../auth";
+import { program, connection } from "../anchor";
+import { buildUnsignedTxBase64 } from "../txbuild";
+import { legacyvault as sdkTx } from "@legacyvault/sdk";
+import { env } from "../env";
+
+export const txRouter = express.Router();
+
+// Build a createVault tx
+txRouter.post("/create-vault", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vaultId: z.string(), // bigint string
+    heartbeatSecs: z.number(),
+    inactivitySecs: z.number(),
+    timelockSecs: z.number(),
+    panicEnabled: z.boolean()
+  });
+  const body = Body.parse(req.body);
+
+  const owner = new PublicKey(req.user.wallet);
+  const ix = await sdkTx.ixCreateVault({
+    program,
+    owner,
+    vaultId: BigInt(body.vaultId),
+    heartbeatSecs: body.heartbeatSecs,
+    inactivitySecs: body.inactivitySecs,
+    timelockSecs: body.timelockSecs,
+    panicEnabled: body.panicEnabled
+  });
+
+  const built = await buildUnsignedTxBase64({ connection, feePayer: owner, ixs: [ix] });
+  res.json({ ok: true, ...built });
+});
+
+// Build addBeneficiary tx
+txRouter.post("/add-beneficiary", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: z.string(),
+    beneficiary: z.string(),
+    shareBps: z.number(),
+    label: z.string().max(16).default("")
+  });
+  const body = Body.parse(req.body);
+
+  const owner = new PublicKey(req.user.wallet);
+  const vault = new PublicKey(body.vault);
+  const beneficiary = new PublicKey(body.beneficiary);
+  const label16 = Array.from(Buffer.from(body.label.padEnd(16, "\0")).slice(0, 16));
+
+  const ix = await sdkTx.ixAddBeneficiary({
+    program,
+    owner,
+    vault,
+    beneficiary,
+    shareBps: body.shareBps,
+    label16
+  });
+
+  const built = await buildUnsignedTxBase64({ connection, feePayer: owner, ixs: [ix] });
+  res.json({ ok: true, ...built });
+});
+
+// Build approveUnlock tx
+txRouter.post("/approve-unlock", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: z.string(), unlock: z.string() });
+  const body = Body.parse(req.body);
+
+  const guardian = new PublicKey(req.user.wallet);
+  const vault = new PublicKey(body.vault);
+  const unlock = new PublicKey(body.unlock);
+
+  const ix = await sdkTx.ixApproveUnlock({ program, vault, unlock, guardian });
+  const built = await buildUnsignedTxBase64({ connection, feePayer: guardian, ixs: [ix] });
+  res.json({ ok: true, ...built });
+});
+api/src/routes/health.ts
+TypeScript
+
+import express from "express";
+export const healthRouter = express.Router();
+healthRouter.get("/", (_, res) => res.json({ ok: true }));
+api/src/main.ts
+TypeScript
+
+import express from "express";
+import { env } from "./env";
+import { healthRouter } from "./routes/health";
+import { authRouter } from "./routes/auth";
+import { vaultsRouter } from "./routes/vaults";
+import { txRouter } from "./routes/tx";
+
+async function main() {
+  const app = express();
+
+  app.use("/health", healthRouter);
+  app.use("/v1/auth", authRouter);
+  app.use("/v1/vaults", vaultsRouter);
+  app.use("/v1/tx", txRouter);
+
+  app.listen(Number(env.API_HTTP_PORT), () => {
+    console.log(`[api] listening on :${env.API_HTTP_PORT}`);
+  });
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+7) Notifier service (notifier/) — queues + cron + templates
+Helius docs mention webhook retries/duplicates; in practice you’ll want idempotent notification dedupe keys, but the notifier here uses DB state. 
+1
+
+notifier/Dockerfile
+Dockerfile
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* ./
+RUN corepack enable && pnpm install --prod
+COPY . .
+CMD ["pnpm", "start"]
+notifier/package.json
+JSON
+
+{
+  "name": "notifier",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --loader ts-node/esm src/main.ts",
+    "start": "node --loader ts-node/esm src/main.ts"
+  },
+  "dependencies": {
+    "@legacyvault/db": "workspace:*",
+    "bullmq": "^5.13.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.15",
+    "twilio": "^5.3.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
+notifier/src/env.ts
+TypeScript
+
+import "dotenv/config";
+import { z } from "zod";
+
+const Env = z.object({
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  NOTIFIER_HTTP_PORT: z.string().default("8789"),
+
+  SMTP_HOST: z.string(),
+  SMTP_PORT: z.string(),
+  SMTP_USER: z.string(),
+  SMTP_PASS: z.string(),
+  EMAIL_FROM: z.string(),
+
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_FROM_NUMBER: z.string().optional()
+});
+
+export const env = Env.parse(process.env);
+notifier/src/db.ts
+TypeScript
+
+export { prisma } from "@legacyvault/db";
+notifier/src/queue.ts
+TypeScript
+
+import { Queue } from "bullmq";
+import { env } from "./env";
+
+export const emailQueue = new Queue("email", { connection: { url: env.REDIS_URL } });
+export const smsQueue = new Queue("sms", { connection: { url: env.REDIS_URL } });
+notifier/src/templates/email.ts
+TypeScript
+
+export function checkInReminderEmail(args: { wallet: string; vaultPubkey: string; dueIso: string }) {
+  return {
+    subject: "LegacyVault check-in reminder",
+    text:
+      `Wallet ${args.wallet}\n` +
+      `Vault ${args.vaultPubkey}\n` +
+      `Check-in due by: ${args.dueIso}\n\n` +
+      `If you are active, open LegacyVault and check in.`
+  };
+}
+
+export function unlockEligibleEmail(args: { vaultPubkey: string; eligibleIso: string }) {
+  return {
+    subject: "LegacyVault unlock eligible",
+    text:
+      `Vault ${args.vaultPubkey} is now eligible for unlock.\n` +
+      `Eligible at: ${args.eligibleIso}\n\n` +
+      `Guardians should review and follow the on-chain process.`
+  };
+}
+notifier/src/templates/sms.ts
+TypeScript
+
+export function checkInReminderSms(args: { vaultPubkey: string; dueIso: string }) {
+  return `LegacyVault: check-in due for vault ${args.vaultPubkey} by ${args.dueIso}.`;
+}
+notifier/src/workers/emailWorker.ts
+TypeScript
+
+import nodemailer from "nodemailer";
+import { Worker } from "bullmq";
+import { env } from "../env";
+
+const transport = nodemailer.createTransport({
+  host: env.SMTP_HOST,
+  port: Number(env.SMTP_PORT),
+  auth: { user: env.SMTP_USER, pass: env.SMTP_PASS }
+});
+
+export function startEmailWorker() {
+  return new Worker("email", async (job) => {
+    const { to, subject, text } = job.data;
+    await transport.sendMail({ from: env.EMAIL_FROM, to, subject, text });
+  }, { connection: { url: env.REDIS_URL } });
+}
+notifier/src/workers/smsWorker.ts
+TypeScript
+
+import { Worker } from "bullmq";
+import { env } from "../env";
+
+export function startSmsWorker() {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_FROM_NUMBER) {
+    console.log("[notifier] Twilio not configured; smsWorker disabled");
+    return null;
+  }
+
+  const twilio = (await import("twilio")).default(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+
+  return new Worker("sms", async (job) => {
+    const { to, body } = job.data;
+    await twilio.messages.create({ from: env.TWILIO_FROM_NUMBER, to, body });
+  }, { connection: { url: env.REDIS_URL } });
+}
+notifier/src/scheduler.ts
+TypeScript
+
+import { prisma } from "./db";
+import { emailQueue } from "./queue";
+import { checkInReminderEmail } from "./templates/email";
+
+/**
+ * Minimal scheduler:
+ * - once per hour: find vaults whose last check-in is older than heartbeat interval
+ * In production, compute exact due dates from on-chain state (indexed) and user preferences.
+ */
+export async function runHourlyScheduler() {
+  // You’d store user notification contacts in DB; for now, placeholder:
+  const demoEmail = process.env.DEMO_NOTIFY_EMAIL;
+  if (!demoEmail) return;
+
+  const vaults = await prisma.vault.findMany({ take: 50, orderBy: { updatedAt: "desc" } });
+
+  for (const v of vaults) {
+    const dueIso = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+    const email = checkInReminderEmail({ wallet: v.ownerWallet, vaultPubkey: v.vaultPubkey, dueIso });
+
+    await emailQueue.add("checkin", { to: demoEmail, ...email }, { removeOnComplete: true });
+  }
+}
+notifier/src/main.ts
+TypeScript
+
+import express from "express";
+import { env } from "./env";
+import { runHourlyScheduler } from "./scheduler";
+import { startEmailWorker } from "./workers/emailWorker";
+
+async function main() {
+  const app = express();
+  app.get("/health", (_, res) => res.json({ ok: true }));
+
+  app.listen(Number(env.NOTIFIER_HTTP_PORT), () => {
+    console.log(`[notifier] listening on :${env.NOTIFIER_HTTP_PORT}`);
+  });
+
+  startEmailWorker();
+
+  // naive cron loop
+  setInterval(() => {
+    runHourlyScheduler().catch(console.error);
+  }, 60 * 60 * 1000);
+
+  // run once at boot
+  await runHourlyScheduler();
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+8) Web app (web/) — Next.js + wallet adapter + SIWS flow
+Solana’s Next.js integration guide provides the baseline wallet integration approach. 
+4
+
+SIWS message format guidance is from Phantom docs. 
+2
+
+web/Dockerfile
+Dockerfile
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json pnpm-lock.yaml* ./
+RUN corepack enable && pnpm install
+COPY . .
+RUN pnpm build
+CMD ["pnpm", "start"]
+web/package.json
+JSON
+
+{
+  "name": "web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "bs58": "^5.0.0",
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@solana/web3.js": "^1.95.4",
+    "@solana/wallet-adapter-base": "^0.9.24",
+    "@solana/wallet-adapter-react": "^0.15.35",
+    "@solana/wallet-adapter-react-ui": "^0.9.35",
+    "@solana/wallet-adapter-wallets": "^0.19.25"
+  }
+}
+web/next.config.mjs
+JavaScript
+
+export default {
+  reactStrictMode: true
+};
+web/src/lib/env.ts
+TypeScript
+
+export const WEB = {
+  apiBase: process.env.NEXT_PUBLIC_API_BASE!,
+  solanaRpc: process.env.NEXT_PUBLIC_SOLANA_RPC_URL!,
+  domain: process.env.NEXT_PUBLIC_DOMAIN!
+};
+web/src/lib/api.ts
+TypeScript
+
+import { WEB } from "./env";
+
+export async function apiFetch(path: string, opts: RequestInit = {}) {
+  const token = typeof window !== "undefined" ? localStorage.getItem("lv_token") : null;
+  const headers = new Headers(opts.headers || {});
+  headers.set("Content-Type", "application/json");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const res = await fetch(`${WEB.apiBase}${path}`, { ...opts, headers });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json?.message || "API error");
+  return json;
+}
+web/src/lib/auth.ts
+TypeScript
+
+import bs58 from "bs58";
+import { apiFetch } from "./api";
+import { WEB } from "./env";
+
+export function buildSiwsMessageClient(args: {
+  domain: string;
+  address: string;
+  statement: string;
+  uri: string;
+  version: string;
+  chainId: string;
+  nonce: string;
+  issuedAt: string;
+}) {
+  return [
+    `${args.domain} wants you to sign in with your Solana account:`,
+    `${args.address}`,
+    "",
+    args.statement,
+    "",
+    `URI: ${args.uri}`,
+    `Version: ${args.version}`,
+    `Chain ID: ${args.chainId}`,
+    `Nonce: ${args.nonce}`,
+    `Issued At: ${args.issuedAt}`
+  ].join("\n");
+}
+
+export async function siwsSignIn(args: {
+  wallet: { publicKey: any; signMessage: (msg: Uint8Array) => Promise<Uint8Array> };
+}) {
+  const nonceResp = await apiFetch("/v1/auth/nonce", { method: "POST", body: JSON.stringify({}) });
+
+  const walletStr = args.wallet.publicKey.toBase58();
+  const statement = "Sign in to LegacyVault to manage your vaults and build transactions.";
+
+  const message = buildSiwsMessageClient({
+    domain: WEB.domain,
+    address: walletStr,
+    statement,
+    uri: `http://${WEB.domain}`,
+    version: "1",
+    chainId: "solana:devnet",
+    nonce: nonceResp.nonce,
+    issuedAt: nonceResp.issuedAt
+  });
+
+  const sigBytes = await args.wallet.signMessage(new TextEncoder().encode(message));
+  const signatureBase58 = bs58.encode(sigBytes);
+
+  const verify = await apiFetch("/v1/auth/verify", {
+    method: "POST",
+    body: JSON.stringify({
+      wallet: walletStr,
+      message,
+      signatureBase58,
+      nonce: nonceResp.nonce,
+      issuedAt: nonceResp.issuedAt
+    })
+  });
+
+  localStorage.setItem("lv_token", verify.token);
+  return verify;
+}
+web/src/lib/solana.ts
+TypeScript
+
+import { Connection } from "@solana/web3.js";
+import { WEB } from "./env";
+export const connection = new Connection(WEB.solanaRpc, "confirmed");
+web/src/components/WalletProviders.tsx
+React
+
+"use client";
+
+import { ReactNode, useMemo } from "react";
+import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
+import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
+import { PhantomWalletAdapter } from "@solana/wallet-adapter-wallets";
+import { WEB } from "../lib/env";
+
+import "@solana/wallet-adapter-react-ui/styles.css";
+
+export function WalletProviders({ children }: { children: ReactNode }) {
+  const wallets = useMemo(() => [new PhantomWalletAdapter()], []);
+  return (
+    <ConnectionProvider endpoint={WEB.solanaRpc}>
+      <WalletProvider wallets={wallets} autoConnect>
+        <WalletModalProvider>{children}</WalletModalProvider>
+      </WalletProvider>
+    </ConnectionProvider>
+  );
+}
+web/src/components/Navbar.tsx
+React
+
+"use client";
+
+import Link from "next/link";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+
+export function Navbar() {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: 12, borderBottom: "1px solid #eee" }}>
+      <div style={{ display: "flex", gap: 12 }}>
+        <Link href="/">Home</Link>
+        <Link href="/signin">Sign in</Link>
+        <Link href="/dashboard">Dashboard</Link>
+      </div>
+      <WalletMultiButton />
+    </div>
+  );
+}
+web/src/app/layout.tsx
+React
+
+import { ReactNode } from "react";
+import { WalletProviders } from "../components/WalletProviders";
+import { Navbar } from "../components/Navbar";
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        <WalletProviders>
+          <Navbar />
+          <div style={{ padding: 16 }}>{children}</div>
+        </WalletProviders>
+      </body>
+    </html>
+  );
+}
+web/src/app/page.tsx
+React
+
+export default function HomePage() {
+  return (
+    <div>
+      <h1>LegacyVault</h1>
+      <p>Digital estate vaults on Solana (alpha scaffold).</p>
+    </div>
+  );
+}
+web/src/app/signin/page.tsx
+React
+
+"use client";
+
+import { useWallet } from "@solana/wallet-adapter-react";
+import { siwsSignIn } from "../../lib/auth";
+
+export default function SignInPage() {
+  const wallet = useWallet();
+
+  return (
+    <div>
+      <h2>Sign in</h2>
+      <p>This uses SIWS-style message signing.</p>
+
+      <button
+        disabled={!wallet.connected || !wallet.signMessage}
+        onClick={async () => {
+          const res = await siwsSignIn({ wallet: wallet as any });
+          alert(`Signed in. Expires: ${res.expiresAt}`);
+        }}
+      >
+        Sign in with wallet
+      </button>
+
+      {!wallet.signMessage && <p>Your wallet does not support signMessage.</p>}
+    </div>
+  );
+}
+web/src/app/dashboard/page.tsx
+React
+
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { apiFetch } from "../../lib/api";
+
+export default function DashboardPage() {
+  const [vaults, setVaults] = useState<any[]>([]);
+
+  useEffect(() => {
+    apiFetch("/v1/vaults")
+      .then((r) => setVaults(r.vaults))
+      .catch(() => setVaults([]));
+  }, []);
+
+  return (
+    <div>
+      <h2>Dashboard</h2>
+      <ul>
+        {vaults.map(v => (
+          <li key={v.vaultPubkey}>
+            <Link href={`/vault/${v.vaultPubkey}`}>{v.vaultPubkey}</Link> — {v.status}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+web/src/app/vault/[vault]/page.tsx
+React
+
+"use client";
+
+import { useParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { apiFetch } from "../../../lib/api";
+
+export default function VaultPage() {
+  const params = useParams();
+  const vault = params.vault as string;
+
+  const [data, setData] = useState<any>(null);
+
+  useEffect(() => {
+    apiFetch(`/v1/vaults/${vault}`).then(setData).catch(() => setData(null));
+  }, [vault]);
+
+  return (
+    <div>
+      <h2>Vault</h2>
+      <pre style={{ background: "#f7f7f7", padding: 12 }}>
+        {JSON.stringify(data, null, 2)}
+      </pre>
+      <p>Next: add tx builder UI (create vault, add beneficiaries, guardian approval, distribution batches).</p>
+    </div>
+  );
+}
+9) “One command boot” steps
+Create .env from .env.example
+Install dependencies:
+Bash
+
+pnpm i
+Run migrations:
+Bash
+
+pnpm db:migrate
+Start stack:
+Bash
+
+docker compose up --build
+
+
+indexer/src/handlers/derivedState.ts — fully implemented mapping all Anchor events → Prisma derived state
+api/src/routes/tx.ts — expanded to cover the entire protocol surface (vault/plan/liveness/unlock/dispute/distribution/subscription/pro-guardian/bonds)
+web/src/app/vault/[vault]/page.tsx — a complete guided flow UI: setup plan → unlock → distribute
+I’m also including two tiny integration patches that are required for these to actually run:
+
+a patch to indexer/src/handlers/eventsToDb.ts so it calls applyDerivedStateFromEvents
+a patch to api/src/routes/vaults.ts to add a /full endpoint (UI uses it)
+1) indexer/src/handlers/derivedState.ts
+This file assumes your Prisma schema includes Document and AssetRule models (recommended for a full build).
+If you don’t have them yet, add them (schema snippet at top of file).
+
+TypeScript
+
+// indexer/src/handlers/derivedState.ts
+import { PublicKey } from "@solana/web3.js";
+import { prisma } from "../db";
+
+/**
+ * REQUIRED Prisma additions (if not present yet):
+ *
+ * model Document {
+ *   id          String   @id @default(cuid())
+ *   vaultId     String
+ *   vault       Vault    @relation(fields: [vaultId], references: [id])
+ *   docHashHex  String
+ *   uri         String?
+ *   uriLen      Int
+ *   tsUnix      BigInt
+ *   createdAt   DateTime @default(now())
+ *   @@unique([vaultId, docHashHex])
+ * }
+ *
+ * model AssetRule {
+ *   id                 String   @id @default(cuid())
+ *   vaultId            String
+ *   vault              Vault    @relation(fields: [vaultId], references: [id])
+ *   mint               String
+ *   mode               String
+ *   assignedBeneficiary String
+ *   tsUnix             BigInt
+ *   updatedAt          DateTime @updatedAt
+ *   @@unique([vaultId, mint])
+ * }
+ */
+
+type AnchorEvent = { name: string; data: any };
+
+function pkToStr(x: any): string {
+  if (!x) return "";
+  if (typeof x === "string") return x;
+  // Anchor often returns PublicKey objects
+  if (x instanceof PublicKey) return x.toBase58();
+  if (typeof x?.toBase58 === "function") return x.toBase58();
+  return String(x);
+}
+
+function toBigInt(x: any): bigint {
+  if (x === null || x === undefined) return 0n;
+  if (typeof x === "bigint") return x;
+  if (typeof x === "number") return BigInt(Math.trunc(x));
+  if (typeof x === "string") return BigInt(x);
+  // Anchor BN
+  if (typeof x?.toString === "function") return BigInt(x.toString());
+  return 0n;
+}
+
+function toNumber(x: any): number {
+  if (x === null || x === undefined) return 0;
+  if (typeof x === "number") return x;
+  if (typeof x === "bigint") return Number(x);
+  if (typeof x === "string") return Number(x);
+  if (typeof x?.toString === "function") return Number(x.toString());
+  return 0;
+}
+
+function field<T = any>(obj: any, ...names: string[]): T | undefined {
+  for (const n of names) {
+    if (obj && Object.prototype.hasOwnProperty.call(obj, n)) return obj[n];
+  }
+  return undefined;
+}
+
+async function ensureVaultByPubkey(vaultPubkey: string, ownerWallet?: string, vaultIdU64?: string) {
+  const status = "Unknown";
+  return prisma.vault.upsert({
+    where: { vaultPubkey },
+    create: {
+      vaultPubkey,
+      ownerWallet: ownerWallet ?? "unknown",
+      vaultIdU64: vaultIdU64 ?? null,
+      status
+    },
+    update: {
+      ownerWallet: ownerWallet ?? undefined,
+      vaultIdU64: vaultIdU64 ?? undefined
+    }
+  });
+}
+
+async function ensureUnlockByPubkey(unlockPubkey: string, vaultId: string, nonceU64?: string) {
+  return prisma.unlockSession.upsert({
+    where: { unlockPubkey },
+    create: {
+      unlockPubkey,
+      vaultId,
+      nonceU64: nonceU64 ?? "0",
+      status: "Unknown",
+      initiatedBy: "unknown",
+      initiatedAtUnix: 0n,
+      approvals: 0,
+      threshold: 0,
+      approvedAtUnix: null,
+      executableAtUnix: null
+    },
+    update: {
+      nonceU64: nonceU64 ?? undefined
+    }
+  });
+}
+
+export async function applyDerivedStateFromEvents(args: {
+  signature: string;
+  slot: bigint;
+  blockTime?: bigint | null;
+  programId: string;
+  events: AnchorEvent[];
+}) {
+  // Run in a single DB transaction for consistency
+  await prisma.$transaction(async (tx) => {
+    for (const evt of args.events) {
+      const d = evt.data ?? {};
+      const tsUnix = toBigInt(field(d, "ts", "timestamp", "tsUnix") ?? 0);
+
+      switch (evt.name) {
+        // --------------------
+        // Vault lifecycle / config
+        // --------------------
+        case "VaultCreated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const owner = pkToStr(field(d, "owner"));
+          const vaultId = toBigInt(field(d, "vaultId", "vault_id") ?? 0).toString();
+
+          await tx.vault.upsert({
+            where: { vaultPubkey },
+            create: {
+              vaultPubkey,
+              ownerWallet: owner,
+              vaultIdU64: vaultId,
+              status: "Active"
+            },
+            update: {
+              ownerWallet: owner,
+              vaultIdU64: vaultId,
+              status: "Active"
+            }
+          });
+          break;
+        }
+
+        case "PanicFrozen": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          await tx.vault.updateMany({ where: { vaultPubkey }, data: { status: "Frozen" } });
+          break;
+        }
+
+        case "Unfrozen": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          await tx.vault.updateMany({ where: { vaultPubkey }, data: { status: "Active" } });
+          break;
+        }
+
+        case "DocumentSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          const docHash = field(d, "docHash", "doc_hash") as number[] | Uint8Array | undefined;
+          const docHashHex = docHash ? Buffer.from(docHash as any).toString("hex") : "";
+
+          const uriLen = toNumber(field(d, "docUriLen", "doc_uri_len") ?? 0);
+          // actual URI string isn’t in event; stored on-chain in vault state; optional
+          await (tx as any).document?.upsert?.({
+            where: { vaultId_docHashHex: { vaultId: vault.id, docHashHex } },
+            create: { vaultId: vault.id, docHashHex, uri: null, uriLen, tsUnix },
+            update: { uriLen, tsUnix }
+          });
+          break;
+        }
+
+        // --------------------
+        // Guardians
+        // --------------------
+        case "GuardianAdded": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const guardian = pkToStr(field(d, "guardian"));
+          const role = String(field(d, "role") ?? "Personal");
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await tx.guardian.upsert({
+            where: { vaultId_guardian: { vaultId: vault.id, guardian } },
+            create: { vaultId: vault.id, guardian, role, active: true },
+            update: { role, active: true }
+          });
+
+          break;
+        }
+
+        case "GuardianRemoved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const guardian = pkToStr(field(d, "guardian"));
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await tx.guardian.updateMany({
+            where: { vaultId: vault.id, guardian },
+            data: { active: false }
+          });
+          break;
+        }
+
+        case "GuardianThresholdSet": {
+          // You may persist this in a VaultSettings table; current schema stores only Vault.status.
+          // We still touch updatedAt via a no-op update so UI refreshes.
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          await tx.vault.updateMany({ where: { vaultPubkey }, data: {} });
+          break;
+        }
+
+        // --------------------
+        // Beneficiaries
+        // --------------------
+        case "BeneficiaryAdded": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+          const shareBps = toNumber(field(d, "shareBps", "share_bps") ?? 0);
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await tx.beneficiary.upsert({
+            where: { vaultId_beneficiary: { vaultId: vault.id, beneficiary } },
+            create: {
+              vaultId: vault.id,
+              beneficiary,
+              shareBps,
+              label: null,
+              active: true
+            },
+            update: { shareBps, active: true }
+          });
+          break;
+        }
+
+        case "BeneficiaryUpdated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+          const shareBps = toNumber(field(d, "shareBps", "share_bps") ?? 0);
+          const active = Boolean(field(d, "active") ?? true);
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await tx.beneficiary.upsert({
+            where: { vaultId_beneficiary: { vaultId: vault.id, beneficiary } },
+            create: { vaultId: vault.id, beneficiary, shareBps, label: null, active },
+            update: { shareBps, active }
+          });
+          break;
+        }
+
+        case "BeneficiaryRemoved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+          await tx.beneficiary.updateMany({
+            where: { vaultId: vault.id, beneficiary },
+            data: { active: false }
+          });
+          break;
+        }
+
+        // --------------------
+        // Asset rules
+        // --------------------
+        case "AssetRuleSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const mint = pkToStr(field(d, "mint"));
+          const mode = String(field(d, "mode") ?? "ProRata");
+          const assignedBeneficiary = pkToStr(field(d, "assignedBeneficiary", "assigned_beneficiary"));
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await (tx as any).assetRule?.upsert?.({
+            where: { vaultId_mint: { vaultId: vault.id, mint } },
+            create: { vaultId: vault.id, mint, mode, assignedBeneficiary, tsUnix },
+            update: { mode, assignedBeneficiary, tsUnix }
+          });
+          break;
+        }
+
+        // --------------------
+        // Check-in
+        // --------------------
+        case "CheckIn": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          // For richer UX, persist lastCheckinUnix as a Vault column.
+          await tx.vault.updateMany({ where: { vaultPubkey }, data: {} });
+          break;
+        }
+
+        // --------------------
+        // Unlock lifecycle
+        // --------------------
+        case "UnlockInitiated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const nonce = toBigInt(field(d, "nonce") ?? 0).toString();
+          const initiatedBy = pkToStr(field(d, "initiatedBy", "initiated_by"));
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+          await tx.vault.update({ where: { id: vault.id }, data: { status: "Unlocking" } });
+
+          await tx.unlockSession.upsert({
+            where: { unlockPubkey },
+            create: {
+              unlockPubkey,
+              vaultId: vault.id,
+              nonceU64: nonce,
+              status: "Proposed",
+              initiatedBy,
+              initiatedAtUnix: tsUnix,
+              approvals: 0,
+              threshold: 0,
+              approvedAtUnix: null,
+              executableAtUnix: null
+            },
+            update: {
+              vaultId: vault.id,
+              nonceU64: nonce,
+              status: "Proposed",
+              initiatedBy,
+              initiatedAtUnix: tsUnix
+            }
+          });
+          break;
+        }
+
+        case "UnlockApproved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const guardian = pkToStr(field(d, "guardian"));
+          const approvals = toNumber(field(d, "approvals") ?? 0);
+          const threshold = toNumber(field(d, "threshold") ?? 0);
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+          const unlock = await ensureUnlockByPubkey(unlockPubkey, vault.id);
+
+          await tx.unlockSession.update({
+            where: { id: unlock.id },
+            data: {
+              approvals,
+              threshold,
+              status: approvals >= threshold && threshold > 0 ? "Approved" : "Proposed"
+            }
+          });
+
+          await tx.approval.upsert({
+            where: { unlockId_guardian: { unlockId: unlock.id, guardian } },
+            create: { unlockId: unlock.id, guardian, approvedAtUnix: tsUnix },
+            update: { approvedAtUnix: tsUnix }
+          });
+
+          break;
+        }
+
+        case "UnlockCancelled": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+          await tx.vault.update({ where: { id: vault.id }, data: { status: "Active" } });
+
+          await tx.unlockSession.updateMany({
+            where: { unlockPubkey },
+            data: { status: "Cancelled" }
+          });
+          break;
+        }
+
+        case "DisputeOpened": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const openedBy = pkToStr(field(d, "openedBy", "opened_by"));
+          const noteHash = field(d, "noteHash", "note_hash") as number[] | Uint8Array | undefined;
+          const noteHashHex = noteHash ? Buffer.from(noteHash as any).toString("hex") : "";
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.unlockSession.update({ where: { id: unlock.id }, data: { status: "Disputed" } });
+
+            await tx.disputeCase.upsert({
+              where: { unlockId: unlock.id },
+              create: {
+                unlockId: unlock.id,
+                status: "Open",
+                openedBy,
+                openedAtUnix: tsUnix,
+                noteHashHex
+              },
+              update: {
+                status: "Open",
+                openedBy,
+                openedAtUnix: tsUnix,
+                noteHashHex
+              }
+            });
+          }
+          break;
+        }
+
+        case "DisputeResolved": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const status = String(field(d, "status") ?? "ResolvedProceed");
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.disputeCase.updateMany({
+              where: { unlockId: unlock.id },
+              data: {
+                status,
+                resolvedAt: new Date()
+              }
+            });
+
+            // unlock status update is program-specific; approximate:
+            await tx.unlockSession.update({
+              where: { id: unlock.id },
+              data: {
+                status: status.includes("Cancel") ? "Cancelled" : unlock.status
+              }
+            });
+          }
+          break;
+        }
+
+        // --------------------
+        // Distributions
+        // --------------------
+        case "SolDistributionInitialized": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const totalDistributable = toBigInt(field(d, "totalDistributable", "total_distributable") ?? 0);
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.distributionSolSession.upsert({
+              where: { unlockId: unlock.id },
+              create: {
+                unlockId: unlock.id,
+                totalDistributable,
+                paidTotal: 0n,
+                cursor: 0,
+                done: totalDistributable === 0n
+              },
+              update: { totalDistributable }
+            });
+          }
+          break;
+        }
+
+        case "SolDistributionBatchExecuted": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const newCursor = toNumber(field(d, "newCursor", "new_cursor") ?? 0);
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.distributionSolSession.updateMany({
+              where: { unlockId: unlock.id },
+              data: {
+                cursor: newCursor
+              }
+            });
+          }
+          break;
+        }
+
+        case "SplDistributionInitialized": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const mint = pkToStr(field(d, "mint"));
+          const totalBalance = toBigInt(field(d, "totalBalance", "total_balance") ?? 0);
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.distributionSplSession.upsert({
+              where: { unlockId_mint: { unlockId: unlock.id, mint } },
+              create: { unlockId: unlock.id, mint, totalBalance, paidTotal: 0n, cursor: 0, done: totalBalance === 0n },
+              update: { totalBalance }
+            });
+          }
+          break;
+        }
+
+        case "SplDistributionBatchExecuted": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const mint = pkToStr(field(d, "mint"));
+          const newCursor = toNumber(field(d, "newCursor", "new_cursor") ?? 0);
+          const done = Boolean(field(d, "done") ?? false);
+
+          const unlock = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (unlock) {
+            await tx.distributionSplSession.updateMany({
+              where: { unlockId: unlock.id, mint },
+              data: { cursor: newCursor, done }
+            });
+          }
+          break;
+        }
+
+        case "UnlockFinalized": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+
+          await tx.vault.updateMany({ where: { vaultPubkey }, data: { status: "Distributed" } });
+          await tx.unlockSession.updateMany({ where: { unlockPubkey }, data: { status: "Executed" } });
+          break;
+        }
+
+        // --------------------
+        // Subscription & professional guardians
+        // --------------------
+        case "SubscriptionSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const planId = toNumber(field(d, "planId", "plan_id") ?? 0);
+          const validUntilUnix = toBigInt(field(d, "validUntilUnix", "valid_until_unix") ?? 0);
+
+          const vault = await ensureVaultByPubkey(vaultPubkey);
+
+          await tx.subscription.upsert({
+            where: { vaultId_planId: { vaultId: vault.id, planId } },
+            create: { vaultId: vault.id, planId, validUntilUnix },
+            update: { validUntilUnix }
+          });
+          break;
+        }
+
+        case "GuardianProfileRegistered": {
+          const guardian = pkToStr(field(d, "guardian"));
+          await tx.guardianProfile.upsert({
+            where: { guardian },
+            create: { guardian, displayName: null, websiteUri: null, kycLevel: 0, active: true },
+            update: {}
+          });
+          break;
+        }
+
+        case "GuardianBondUpdated": {
+          const guardian = pkToStr(field(d, "guardian"));
+          const amount = toBigInt(field(d, "amount") ?? 0);
+          const locked = Boolean(field(d, "locked") ?? false);
+
+          await tx.guardianBond.upsert({
+            where: { guardian },
+            create: { guardian, amount, locked },
+            update: { amount, locked }
+          });
+          break;
+        }
+
+        // --------------------
+        // Events we intentionally ignore in derived state (still captured in EventLog)
+        // --------------------
+        case "ConfigInitialized":
+        case "PoolCreated":
+        case "SolDeposited":
+        case "SolWithdrawn":
+        case "SplDeposited":
+        case "SplWithdrawn":
+        default:
+          break;
+      }
+    }
+  });
+}
+Patch: call derived state from eventsToDb.ts
+TypeScript
+
+// indexer/src/handlers/eventsToDb.ts
+import { prisma } from "../db";
+import { applyDerivedStateFromEvents } from "./derivedState";
+
+export async function persistEvents(args: {
+  signature: string;
+  slot: bigint;
+  programId: string;
+  blockTime?: bigint | null;
+  events: Array<{ name: string; data: any }>;
+}) {
+  await prisma.eventLog.upsert({
+    where: { signature: args.signature },
+    create: {
+      signature: args.signature,
+      slot: args.slot,
+      programId: args.programId,
+      eventName: args.events.map(e => e.name).join(","),
+      dataJson: args.events as any,
+      blockTime: args.blockTime ?? null
+    },
+    update: {
+      slot: args.slot,
+      eventName: args.events.map(e => e.name).join(","),
+      dataJson: args.events as any,
+      blockTime: args.blockTime ?? null
+    }
+  });
+
+  // NEW:
+  await applyDerivedStateFromEvents({
+    signature: args.signature,
+    slot: args.slot,
+    blockTime: args.blockTime ?? null,
+    programId: args.programId,
+    events: args.events
+  });
+}
+2) api/src/routes/tx.ts — expanded to cover entire protocol surface
+This is a single file replacement. It:
+
+validates input with zod
+fetches on-chain state when needed (e.g., next unlock nonce, beneficiaries list)
+builds unsigned tx base64 (sometimes with pre-instructions like ATA creation)
+returns { txBase64, blockhash, lastValidBlockHeight, meta }
+TypeScript
+
+// api/src/routes/tx.ts
+import express from "express";
+import { z } from "zod";
+import {
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  TransactionInstruction,
+  SYSVAR_RENT_PUBKEY
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountInstruction
+} from "@solana/spl-token";
+import BN from "bn.js";
+
+import { requireAuth } from "../auth";
+import { program, connection } from "../anchor";
+import { buildUnsignedTxBase64 } from "../txbuild";
+
+// PDAs from sdk (workspace)
+import { legacyvaultPdas as pdas } from "@legacyvault/sdk";
+
+export const txRouter = express.Router();
+
+const PubkeyStr = z.string().refine((s) => {
+  try { new PublicKey(s); return true; } catch { return false; }
+}, "Invalid pubkey");
+
+function pk(s: string) { return new PublicKey(s); }
+
+async function buildTx(res: any, feePayer: PublicKey, ixs: TransactionInstruction[], meta: any = {}) {
+  const built = await buildUnsignedTxBase64({ connection, feePayer, ixs });
+  res.json({ ok: true, ...built, meta });
+}
+
+async function getConfig() {
+  const [cfg] = pdas.configPda(program.programId);
+  return program.account.globalConfig.fetch(cfg) as any;
+}
+
+async function getVaultAcc(vault: PublicKey) {
+  return program.account.vault.fetch(vault) as any;
+}
+
+async function getIndexAcc(vault: PublicKey) {
+  const [index] = pdas.indexPda(program.programId, vault);
+  return { index, acc: await program.account.vaultIndex.fetch(index) as any };
+}
+
+async function maybeCreateAtaIx(payer: PublicKey, owner: PublicKey, mint: PublicKey) {
+  const ata = getAssociatedTokenAddressSync(mint, owner, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const info = await connection.getAccountInfo(ata, "confirmed");
+  if (info) return { ata, ix: null as any };
+  const ix = createAssociatedTokenAccountInstruction(
+    payer, ata, owner, mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return { ata, ix };
+}
+
+/**
+ * NOTE: label16 and fixed byte arrays:
+ * - beneficiary label: 16 bytes (numbers 0..255)
+ * In JS we create it using: Buffer.from(str.padEnd(16,"\0")).slice(0,16)
+ */
+
+txRouter.post("/create-vault", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vaultId: z.string(),
+    heartbeatSecs: z.number().int().positive(),
+    inactivitySecs: z.number().int().positive(),
+    timelockSecs: z.number().int().positive(),
+    panicEnabled: z.boolean()
+  });
+  const body = Body.parse(req.body);
+  const owner = pk(req.user.wallet);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const cfgAcc: any = await program.account.globalConfig.fetch(cfg);
+  const treasury = cfgAcc.treasury as PublicKey;
+
+  const [vault] = pdas.vaultPda(program.programId, owner, BigInt(body.vaultId));
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+  const [index] = pdas.indexPda(program.programId, vault);
+
+  const ix = await program.methods
+    .createVault(
+      new BN(body.vaultId),
+      body.heartbeatSecs,
+      body.inactivitySecs,
+      body.timelockSecs,
+      body.panicEnabled
+    )
+    .accounts({
+      config: cfg,
+      vault,
+      vaultAuth,
+      index,
+      owner,
+      treasury,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix], { vault: vault.toBase58() });
+});
+
+// ---------------------
+// Documents
+// ---------------------
+txRouter.post("/set-document", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    docHashHex: z.string().length(64),
+    docUri: z.string().max(200)
+  });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const docHash = Uint8Array.from(Buffer.from(body.docHashHex, "hex"));
+  const docUriBytes = Array.from(Buffer.from(body.docUri, "utf8"));
+
+  const ix = await program.methods
+    .setDocument(Array.from(docHash) as any, docUriBytes)
+    .accounts({ config: cfg, vault, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Guardians
+// ---------------------
+txRouter.post("/add-guardian", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    guardian: PubkeyStr,
+    role: z.number().int().min(0).max(1) // 0 personal, 1 professional
+  });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const guardian = pk(body.guardian);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [ge] = pdas.guardianEntryPda(program.programId, vault, guardian);
+
+  const ix = await program.methods
+    .addGuardian(body.role)
+    .accounts({
+      config: cfg, vault, index,
+      guardianEntry: ge,
+      guardian,
+      owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/remove-guardian", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, guardian: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const guardian = pk(body.guardian);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [ge] = pdas.guardianEntryPda(program.programId, vault, guardian);
+
+  const ix = await program.methods
+    .removeGuardian()
+    .accounts({
+      config: cfg, vault, index,
+      guardianEntry: ge,
+      guardian,
+      owner
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/set-guardian-threshold", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, threshold: z.number().int().min(1).max(255) });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+
+  const ix = await program.methods
+    .setGuardianThreshold(body.threshold)
+    .accounts({ config: cfg, vault, index, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Beneficiaries
+// ---------------------
+txRouter.post("/add-beneficiary", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    beneficiary: PubkeyStr,
+    shareBps: z.number().int().min(1).max(10_000),
+    label: z.string().max(16).default("")
+  });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const beneficiary = pk(body.beneficiary);
+
+  const label16 = Array.from(Buffer.from(body.label.padEnd(16, "\0")).slice(0, 16));
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [be] = pdas.beneficiaryEntryPda(program.programId, vault, beneficiary);
+
+  const ix = await program.methods
+    .addBeneficiary(body.shareBps, label16)
+    .accounts({
+      config: cfg, vault, index,
+      beneficiaryEntry: be,
+      beneficiary,
+      owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/update-beneficiary", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    beneficiary: PubkeyStr,
+    shareBps: z.number().int().min(0).max(10_000),
+    label: z.string().max(16).default(""),
+    active: z.boolean()
+  });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const beneficiary = pk(body.beneficiary);
+
+  const label16 = Array.from(Buffer.from(body.label.padEnd(16, "\0")).slice(0, 16));
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [be] = pdas.beneficiaryEntryPda(program.programId, vault, beneficiary);
+
+  const ix = await program.methods
+    .updateBeneficiary(body.shareBps, label16, body.active)
+    .accounts({ config: cfg, vault, index, beneficiaryEntry: be, beneficiary, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/remove-beneficiary", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, beneficiary: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const beneficiary = pk(body.beneficiary);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [be] = pdas.beneficiaryEntryPda(program.programId, vault, beneficiary);
+
+  const ix = await program.methods
+    .removeBeneficiary()
+    .accounts({ config: cfg, vault, index, beneficiaryEntry: be, beneficiary, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/assert-beneficiary-total-10k", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+  const { index, acc } = await getIndexAcc(vault);
+
+  const remaining = (acc.beneficiaries as PublicKey[]).map((b) => {
+    const [be] = pdas.beneficiaryEntryPda(program.programId, vault, b);
+    return { pubkey: be, isSigner: false, isWritable: false };
+  });
+
+  const ix = await program.methods
+    .assertBeneficiaryTotal10k()
+    .accounts({ config: cfg, vault, index, owner })
+    .remainingAccounts(remaining)
+    .instruction();
+
+  await buildTx(res, owner, [ix], { beneficiaries: remaining.length });
+});
+
+// ---------------------
+// Asset rules
+// ---------------------
+txRouter.post("/set-asset-rule", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    mint: PubkeyStr,
+    mode: z.number().int().min(0).max(1), // 0=ProRata,1=AssignAll
+    assignedBeneficiary: PubkeyStr.optional()
+  });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [assetRule] = pdas.assetRulePda(program.programId, vault, mint);
+
+  const assigned = body.assignedBeneficiary ? pk(body.assignedBeneficiary) : new PublicKey("11111111111111111111111111111111");
+
+  const ix = await program.methods
+    .setAssetRule(body.mode)
+    .accounts({
+      config: cfg,
+      vault,
+      index,
+      mint,
+      assetRule,
+      assignedBeneficiary: assigned,
+      owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/clear-asset-rule", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, mint: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [assetRule] = pdas.assetRulePda(program.programId, vault, mint);
+
+  const ix = await program.methods
+    .clearAssetRule()
+    .accounts({ config: cfg, vault, mint, assetRule, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Deposits/withdrawals
+// ---------------------
+txRouter.post("/deposit-sol", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, lamports: z.string() });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .depositSol(new BN(body.lamports))
+    .accounts({ config: cfg, vault, owner, systemProgram: SystemProgram.programId })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/withdraw-sol", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, lamports: z.string() });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .withdrawSol(new BN(body.lamports))
+    .accounts({ config: cfg, vault, owner, systemProgram: SystemProgram.programId })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/deposit-spl", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, mint: PubkeyStr, amount: z.string() });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+
+  const ownerAta = getAssociatedTokenAddressSync(mint, owner);
+  const vaultAta = getAssociatedTokenAddressSync(mint, vaultAuth, true);
+
+  const ix = await program.methods
+    .depositSpl(new BN(body.amount))
+    .accounts({
+      config: cfg, vault, vaultAuth, mint,
+      owner,
+      ownerAta,
+      vaultAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/withdraw-spl", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, mint: PubkeyStr, amount: z.string() });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+
+  const ownerAta = getAssociatedTokenAddressSync(mint, owner);
+  const vaultAta = getAssociatedTokenAddressSync(mint, vaultAuth, true);
+
+  const ix = await program.methods
+    .withdrawSpl(new BN(body.amount))
+    .accounts({
+      config: cfg, vault, vaultAuth, mint,
+      owner,
+      ownerAta,
+      vaultAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Liveness
+// ---------------------
+txRouter.post("/check-in", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .checkIn()
+    .accounts({ config: cfg, vault, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/add-delegate", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, delegate: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const delegate = pk(body.delegate);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [de] = pdas.delegateEntryPda(program.programId, vault, delegate);
+
+  const ix = await program.methods
+    .addLivenessDelegate()
+    .accounts({
+      config: cfg,
+      vault,
+      delegateEntry: de,
+      delegate,
+      owner,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/remove-delegate", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, delegate: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const delegate = pk(body.delegate);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [de] = pdas.delegateEntryPda(program.programId, vault, delegate);
+
+  const ix = await program.methods
+    .removeLivenessDelegate()
+    .accounts({ config: cfg, vault, delegateEntry: de, delegate, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/delegate-check-in", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, delegate: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const delegate = pk(req.user.wallet);
+  const vault = pk(body.vault);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [de] = pdas.delegateEntryPda(program.programId, vault, delegate);
+
+  const ix = await program.methods
+    .delegateCheckIn()
+    .accounts({ config: cfg, vault, delegateEntry: de, delegate })
+    .instruction();
+
+  await buildTx(res, delegate, [ix]);
+});
+
+// ---------------------
+// Freeze
+// ---------------------
+txRouter.post("/panic-freeze", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .panicFreeze()
+    .accounts({ config: cfg, vault, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+txRouter.post("/unfreeze", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .unfreeze()
+    .accounts({ config: cfg, vault, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Unlock
+// ---------------------
+txRouter.post("/initiate-unlock", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const guardian = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const [cfg] = pdas.configPda(program.programId);
+
+  const vaultAcc: any = await getVaultAcc(vault);
+  const nextNonce = BigInt(vaultAcc.currentNonce.toString()) + 1n;
+  const [unlock] = pdas.unlockPda(program.programId, vault, nextNonce);
+  const [ge] = pdas.guardianEntryPda(program.programId, vault, guardian);
+
+  const ix = await program.methods
+    .initiateUnlock()
+    .accounts({
+      config: cfg,
+      vault,
+      guardianEntry: ge,
+      unlock,
+      guardian,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, guardian, [ix], { unlock: unlock.toBase58(), nonce: nextNonce.toString() });
+});
+
+txRouter.post("/approve-unlock", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const guardian = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [ge] = pdas.guardianEntryPda(program.programId, vault, guardian);
+  const [approval] = pdas.approvalPda(program.programId, unlock, guardian);
+
+  const ix = await program.methods
+    .approveUnlock()
+    .accounts({
+      config: cfg,
+      vault,
+      guardianEntry: ge,
+      unlock,
+      approval,
+      guardian,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, guardian, [ix]);
+});
+
+txRouter.post("/cancel-unlock", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const owner = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+
+  const ix = await program.methods
+    .cancelUnlock()
+    .accounts({ config: cfg, vault, unlock, owner })
+    .instruction();
+
+  await buildTx(res, owner, [ix]);
+});
+
+// ---------------------
+// Dispute
+// ---------------------
+txRouter.post("/open-dispute", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    unlock: PubkeyStr,
+    noteHashHex: z.string().length(64)
+  });
+  const body = Body.parse(req.body);
+
+  const opener = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [dispute] = pdas.disputePda(program.programId, unlock);
+
+  const noteHash = Uint8Array.from(Buffer.from(body.noteHashHex, "hex"));
+
+  const ix = await program.methods
+    .openDispute(Array.from(noteHash) as any)
+    .accounts({
+      config: cfg,
+      vault,
+      unlock,
+      dispute,
+      opener,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, opener, [ix]);
+});
+
+txRouter.post("/resolve-dispute-cancel", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const arbiter = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [dispute] = pdas.disputePda(program.programId, unlock);
+
+  const ix = await program.methods
+    .resolveDisputeCancel()
+    .accounts({ config: cfg, vault, unlock, dispute, arbiter })
+    .instruction();
+
+  await buildTx(res, arbiter, [ix]);
+});
+
+txRouter.post("/resolve-dispute-proceed", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const arbiter = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [dispute] = pdas.disputePda(program.programId, unlock);
+
+  const ix = await program.methods
+    .resolveDisputeProceed()
+    .accounts({ config: cfg, vault, unlock, dispute, arbiter })
+    .instruction();
+
+  await buildTx(res, arbiter, [ix]);
+});
+
+// ---------------------
+// Distribution (SOL)
+// ---------------------
+txRouter.post("/init-dist-sol", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [distSol] = pdas.distSolPda(program.programId, unlock);
+
+  const ix = await program.methods
+    .initDistributionSolSession()
+    .accounts({
+      config: cfg,
+      vault,
+      unlock,
+      distSol,
+      payer,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, payer, [ix], { distSol: distSol.toBase58() });
+});
+
+txRouter.post("/exec-dist-sol-batch", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    unlock: PubkeyStr,
+    startIndex: z.number().int().min(0),
+    batchSize: z.number().int().min(1).max(25)
+  });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [distSol] = pdas.distSolPda(program.programId, unlock);
+
+  const idxAcc: any = await program.account.vaultIndex.fetch(index);
+  const ben: PublicKey[] = idxAcc.beneficiaries;
+
+  const slice = ben.slice(body.startIndex, body.startIndex + body.batchSize);
+  const remaining = [];
+  for (const b of slice) {
+    const [be] = pdas.beneficiaryEntryPda(program.programId, vault, b);
+    remaining.push({ pubkey: be, isSigner: false, isWritable: false });
+    remaining.push({ pubkey: b, isSigner: false, isWritable: true });
+  }
+
+  const ix = await program.methods
+    .executeDistributionSolBatch(body.startIndex, slice.length)
+    .accounts({
+      config: cfg,
+      vault,
+      unlock,
+      index,
+      distSol,
+      systemProgram: SystemProgram.programId
+    })
+    .remainingAccounts(remaining)
+    .instruction();
+
+  await buildTx(res, payer, [ix], { totalBeneficiaries: ben.length });
+});
+
+// ---------------------
+// Distribution (SPL)
+// ---------------------
+txRouter.post("/init-dist-spl", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ vault: PubkeyStr, unlock: PubkeyStr, mint: PubkeyStr });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+  const [distSpl] = pdas.distSplPda(program.programId, unlock, mint);
+
+  const { ata: vaultAta, ix: createVaultAtaIx } = await maybeCreateAtaIx(payer, vaultAuth, mint);
+
+  const ix = await program.methods
+    .initDistributionSplSession()
+    .accounts({
+      config: cfg,
+      vault,
+      unlock,
+      vaultAuth,
+      mint,
+      distSpl,
+      vaultAta,
+      payer,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  const ixs = [createVaultAtaIx, ix].filter(Boolean) as TransactionInstruction[];
+  await buildTx(res, payer, ixs, { vaultAta: vaultAta.toBase58(), distSpl: distSpl.toBase58() });
+});
+
+txRouter.post("/exec-dist-spl-batch", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    unlock: PubkeyStr,
+    mint: PubkeyStr,
+    startIndex: z.number().int().min(0),
+    batchSize: z.number().int().min(1).max(10),
+    createMissingAtas: z.boolean().default(false)
+  });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+  const mint = pk(body.mint);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+  const [index] = pdas.indexPda(program.programId, vault);
+  const [distSpl] = pdas.distSplPda(program.programId, unlock, mint);
+
+  const vaultAta = getAssociatedTokenAddressSync(mint, vaultAuth, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+
+  const idxAcc: any = await program.account.vaultIndex.fetch(index);
+  const ben: PublicKey[] = idxAcc.beneficiaries;
+
+  const slice = ben.slice(body.startIndex, body.startIndex + body.batchSize);
+
+  const preIxs: TransactionInstruction[] = [];
+  const remaining: any[] = [];
+
+  for (const b of slice) {
+    const [be] = pdas.beneficiaryEntryPda(program.programId, vault, b);
+    const ata = getAssociatedTokenAddressSync(mint, b, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+
+    if (body.createMissingAtas) {
+      const info = await connection.getAccountInfo(ata, "confirmed");
+      if (!info) {
+        preIxs.push(
+          createAssociatedTokenAccountInstruction(
+            payer, ata, b, mint, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      }
+    }
+
+    remaining.push({ pubkey: be, isSigner: false, isWritable: false });
+    remaining.push({ pubkey: b, isSigner: false, isWritable: false });
+    remaining.push({ pubkey: ata, isSigner: false, isWritable: true });
+  }
+
+  const ix = await program.methods
+    .executeDistributionSplBatch(body.startIndex, slice.length)
+    .accounts({
+      config: cfg,
+      vault,
+      vaultAuth,
+      unlock,
+      index,
+      mint,
+      distSpl,
+      vaultAta,
+      tokenProgram: TOKEN_PROGRAM_ID
+    })
+    .remainingAccounts(remaining)
+    .instruction();
+
+  await buildTx(res, payer, [...preIxs, ix], { totalBeneficiaries: ben.length });
+});
+
+// finalize unlock (requires dist_sol + remaining dist_spl sessions)
+txRouter.post("/finalize-unlock", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    unlock: PubkeyStr,
+    splMints: z.array(PubkeyStr).default([])
+  });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [distSol] = pdas.distSolPda(program.programId, unlock);
+
+  const remaining = body.splMints.map((m) => {
+    const mint = pk(m);
+    const [distSpl] = pdas.distSplPda(program.programId, unlock, mint);
+    return { pubkey: distSpl, isSigner: false, isWritable: false };
+  });
+
+  const ix = await program.methods
+    .finalizeUnlock()
+    .accounts({ config: cfg, vault, unlock, distSol })
+    .remainingAccounts(remaining)
+    .instruction();
+
+  await buildTx(res, payer, [ix]);
+});
+
+// ---------------------
+// Subscription
+// ---------------------
+txRouter.post("/set-subscription", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    planId: z.number().int().min(0).max(255),
+    validUntilUnix: z.string()
+  });
+  const body = Body.parse(req.body);
+
+  const authority = pk(req.user.wallet);
+  const vault = pk(body.vault);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [sub] = pdas.subscriptionPda(program.programId, vault);
+
+  const ix = await program.methods
+    .setSubscription(body.planId, new BN(body.validUntilUnix))
+    .accounts({
+      config: cfg,
+      vault,
+      subscription: sub,
+      authority,
+      payer: authority,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, authority, [ix]);
+});
+
+txRouter.post("/renew-subscription", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    planId: z.number().int().min(0).max(255),
+    addSecs: z.string(),
+    feeLamports: z.string()
+  });
+  const body = Body.parse(req.body);
+
+  const payer = pk(req.user.wallet);
+  const vault = pk(body.vault);
+
+  const cfgAcc = await getConfig();
+  const treasury = cfgAcc.treasury as PublicKey;
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [sub] = pdas.subscriptionPda(program.programId, vault);
+
+  const ix = await program.methods
+    .renewSubscription(body.planId, new BN(body.addSecs), new BN(body.feeLamports))
+    .accounts({
+      config: cfg,
+      vault,
+      subscription: sub,
+      payer,
+      treasury,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, payer, [ix]);
+});
+
+// ---------------------
+// Professional guardian profile
+// ---------------------
+txRouter.post("/register-guardian-profile", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    displayName: z.string().max(32).default(""),
+    websiteUri: z.string().max(100).default("")
+  });
+  const body = Body.parse(req.body);
+
+  const guardian = pk(req.user.wallet);
+  const [cfg] = pdas.configPda(program.programId);
+  const [profile] = pdas.guardianProfilePda(program.programId, guardian);
+
+  const ix = await program.methods
+    .registerGuardianProfile(
+      Array.from(Buffer.from(body.displayName, "utf8")),
+      Array.from(Buffer.from(body.websiteUri, "utf8"))
+    )
+    .accounts({
+      config: cfg,
+      profile,
+      guardian,
+      systemProgram: SystemProgram.programId
+    })
+    .instruction();
+
+  await buildTx(res, guardian, [ix]);
+});
+
+// ---------------------
+// Bond management
+// ---------------------
+txRouter.post("/bond-topup", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ lamports: z.string() });
+  const body = Body.parse(req.body);
+
+  const guardian = pk(req.user.wallet);
+  const [cfg] = pdas.configPda(program.programId);
+  const [bond] = pdas.guardianBondPda(program.programId, guardian);
+
+  const ix = await program.methods
+    .createOrTopupGuardianBond(new BN(body.lamports))
+    .accounts({ config: cfg, bond, guardian, systemProgram: SystemProgram.programId })
+    .instruction();
+
+  await buildTx(res, guardian, [ix]);
+});
+
+txRouter.post("/bond-withdraw", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({ lamports: z.string() });
+  const body = Body.parse(req.body);
+
+  const guardian = pk(req.user.wallet);
+  const [cfg] = pdas.configPda(program.programId);
+  const [bond] = pdas.guardianBondPda(program.programId, guardian);
+
+  const ix = await program.methods
+    .withdrawGuardianBond(new BN(body.lamports))
+    .accounts({ config: cfg, bond, guardian })
+    .instruction();
+
+  await buildTx(res, guardian, [ix]);
+});
+3) Complete guided flow UI — web/src/app/vault/[vault]/page.tsx
+This page:
+
+Fetches /v1/vaults/:vault/full
+Has 3 sections:
+Setup Plan (guardians/beneficiaries/threshold/assert shares)
+Unlock (check-in / initiate / approve / cancel / dispute)
+Distribute (init + batch execute SOL, discover SPL mints in vault, init + batch execute SPL, finalize)
+Web dependencies needed:
+
+add to web/package.json:
+@solana/spl-token
+@legacyvault/sdk
+@coral-xyz/anchor (optional; not used here)
+React
+
+// web/src/app/vault/[vault]/page.tsx
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "next/navigation";
+import { apiFetch } from "../../../lib/api";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { PublicKey, Transaction } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { legacyvaultPdas as pdas } from "@legacyvault/sdk";
+
+type TxBuildResp = {
+  ok: boolean;
+  txBase64: string;
+  blockhash: string;
+  lastValidBlockHeight: number;
+  meta?: any;
+};
+
+function Input({ label, value, onChange, placeholder }: any) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: "#555" }}>{label}</div>
+      <input
+        style={{ padding: 10, border: "1px solid #ddd", borderRadius: 8 }}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+      />
+    </div>
+  );
+}
+
+function Section({ title, children }: any) {
+  return (
+    <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+export default function VaultPage() {
+  const params = useParams();
+  const vaultPubkey = params.vault as string;
+
+  const { connection } = useConnection();
+  const wallet = useWallet();
+
+  const [state, setState] = useState<any>(null);
+  const [lastSig, setLastSig] = useState<string>("");
+
+  // Setup plan form
+  const [guardianPk, setGuardianPk] = useState("");
+  const [guardianRole, setGuardianRole] = useState<"0" | "1">("0");
+  const [threshold, setThreshold] = useState("2");
+
+  const [beneficiaryPk, setBeneficiaryPk] = useState("");
+  const [shareBps, setShareBps] = useState("5000");
+  const [beneficiaryLabel, setBeneficiaryLabel] = useState("Spouse");
+  const [beneficiaryActive, setBeneficiaryActive] = useState(true);
+
+  // Unlock/dispute
+  const [unlockPk, setUnlockPk] = useState("");
+  const [noteHashHex, setNoteHashHex] = useState("".padEnd(64, "0"));
+
+  // Distribution
+  const [solBatchSize, setSolBatchSize] = useState("10");
+  const [solStartIndex, setSolStartIndex] = useState("0");
+
+  const [splBatchSize, setSplBatchSize] = useState("5");
+  const [splStartIndex, setSplStartIndex] = useState("0");
+  const [createMissingAtas, setCreateMissingAtas] = useState(false);
+
+  const [discoveredMints, setDiscoveredMints] = useState<string[]>([]);
+  const [selectedMints, setSelectedMints] = useState<Record<string, boolean>>({});
+
+  const programId = useMemo(() => {
+    const pid = process.env.NEXT_PUBLIC_LEGACYVAULT_PROGRAM_ID!;
+    return new PublicKey(pid);
+  }, []);
+
+  async function refresh() {
+    try {
+      const r = await apiFetch(`/v1/vaults/${vaultPubkey}/full`);
+      setState(r);
+      // if there’s an active unlock in response, set it
+      const latestUnlock = r?.vault?.unlockSessions?.[0]?.unlockPubkey;
+      if (latestUnlock && !unlockPk) setUnlockPk(latestUnlock);
+    } catch (e: any) {
+      setState({ ok: false, error: e.message });
+    }
+  }
+
+  useEffect(() => { refresh(); }, [vaultPubkey]);
+
+  async function signAndSendBuiltTx(resp: TxBuildResp) {
+    if (!wallet.publicKey || !wallet.signTransaction) throw new Error("Wallet not ready (need signTransaction).");
+
+    const tx = Transaction.from(Buffer.from(resp.txBase64, "base64"));
+    const sig = await wallet.sendTransaction(tx, connection, { skipPreflight: false });
+    await connection.confirmTransaction(
+      { signature: sig, blockhash: resp.blockhash, lastValidBlockHeight: resp.lastValidBlockHeight },
+      "confirmed"
+    );
+    setLastSig(sig);
+    await refresh();
+    return sig;
+  }
+
+  async function runTx(endpoint: string, body: any) {
+    const resp = await apiFetch(endpoint, { method: "POST", body: JSON.stringify(body) }) as TxBuildResp;
+    if (!resp.ok) throw new Error("tx build failed");
+    const sig = await signAndSendBuiltTx(resp);
+    if (resp.meta?.unlock) setUnlockPk(resp.meta.unlock);
+    return { sig, meta: resp.meta };
+  }
+
+  async function discoverVaultMints() {
+    // Discover SPL token mints held by vault authority (vault_auth PDA)
+    const vault = new PublicKey(vaultPubkey);
+    const [vaultAuth] = pdas.vaultAuthPda(programId, vault);
+
+    const tokAccs = await connection.getTokenAccountsByOwner(vaultAuth, { programId: TOKEN_PROGRAM_ID }, "confirmed");
+    const mints = new Set<string>();
+    for (const ta of tokAccs.value) {
+      // Parse minimal: mint is at bytes 0..32 in token account data
+      const data = ta.account.data;
+      const mint = new PublicKey(data.slice(0, 32)).toBase58();
+      // balance not parsed here (requires unpack); still useful
+      mints.add(mint);
+    }
+    const arr = Array.from(mints);
+    setDiscoveredMints(arr);
+    const sel: Record<string, boolean> = {};
+    for (const m of arr) sel[m] = selectedMints[m] ?? true;
+    setSelectedMints(sel);
+  }
+
+  return (
+    <div style={{ maxWidth: 900 }}>
+      <h2>Vault: {vaultPubkey}</h2>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <button onClick={refresh}>Refresh</button>
+        {lastSig && (
+          <div style={{ fontSize: 12 }}>
+            Last tx: <code>{lastSig}</code>
+          </div>
+        )}
+      </div>
+
+      <Section title="0) Status / Debug">
+        <pre style={{ background: "#f7f7f7", padding: 12, borderRadius: 8, overflowX: "auto" }}>
+          {JSON.stringify(state, null, 2)}
+        </pre>
+      </Section>
+
+      <Section title="1) Setup plan (Owner)">
+        <h4>Guardians</h4>
+        <Input label="Guardian pubkey" value={guardianPk} onChange={setGuardianPk} placeholder="..." />
+        <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+          <label>
+            Role:
+            <select value={guardianRole} onChange={(e) => setGuardianRole(e.target.value as any)}>
+              <option value="0">Personal</option>
+              <option value="1">Professional</option>
+            </select>
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 12 }}>
+          <button
+            disabled={!wallet.publicKey || !guardianPk}
+            onClick={() => runTx("/v1/tx/add-guardian", { vault: vaultPubkey, guardian: guardianPk, role: Number(guardianRole) })}
+          >
+            Add guardian
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !guardianPk}
+            onClick={() => runTx("/v1/tx/remove-guardian", { vault: vaultPubkey, guardian: guardianPk })}
+          >
+            Remove guardian
+          </button>
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <Input label="Guardian threshold (M)" value={threshold} onChange={setThreshold} placeholder="2" />
+          <button
+            disabled={!wallet.publicKey}
+            onClick={() => runTx("/v1/tx/set-guardian-threshold", { vault: vaultPubkey, threshold: Number(threshold) })}
+          >
+            Set threshold
+          </button>
+        </div>
+
+        <hr style={{ margin: "24px 0" }} />
+
+        <h4>Beneficiaries</h4>
+        <Input label="Beneficiary pubkey" value={beneficiaryPk} onChange={setBeneficiaryPk} placeholder="..." />
+        <Input label="Share bps (0..10000)" value={shareBps} onChange={setShareBps} placeholder="5000" />
+        <Input label="Label (<=16 chars)" value={beneficiaryLabel} onChange={setBeneficiaryLabel} placeholder="Spouse" />
+        <div style={{ marginBottom: 12 }}>
+          <label>
+            Active:
+            <input type="checkbox" checked={beneficiaryActive} onChange={(e) => setBeneficiaryActive(e.target.checked)} />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <button
+            disabled={!wallet.publicKey || !beneficiaryPk}
+            onClick={() =>
+              runTx("/v1/tx/add-beneficiary", {
+                vault: vaultPubkey,
+                beneficiary: beneficiaryPk,
+                shareBps: Number(shareBps),
+                label: beneficiaryLabel
+              })
+            }
+          >
+            Add beneficiary
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !beneficiaryPk}
+            onClick={() =>
+              runTx("/v1/tx/update-beneficiary", {
+                vault: vaultPubkey,
+                beneficiary: beneficiaryPk,
+                shareBps: Number(shareBps),
+                label: beneficiaryLabel,
+                active: beneficiaryActive
+              })
+            }
+          >
+            Update beneficiary
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !beneficiaryPk}
+            onClick={() => runTx("/v1/tx/remove-beneficiary", { vault: vaultPubkey, beneficiary: beneficiaryPk })}
+          >
+            Remove beneficiary
+          </button>
+
+          <button
+            disabled={!wallet.publicKey}
+            onClick={() => runTx("/v1/tx/assert-beneficiary-total-10k", { vault: vaultPubkey })}
+          >
+            Assert shares sum to 10,000 bps
+          </button>
+        </div>
+
+        <hr style={{ margin: "24px 0" }} />
+
+        <h4>Liveness</h4>
+        <button disabled={!wallet.publicKey} onClick={() => runTx("/v1/tx/check-in", { vault: vaultPubkey })}>
+          Check in (Owner)
+        </button>
+      </Section>
+
+      <Section title="2) Unlock (Guardians + Owner override)">
+        <Input label="Unlock pubkey (auto-filled after initiate)" value={unlockPk} onChange={setUnlockPk} placeholder="..." />
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <button disabled={!wallet.publicKey} onClick={() => runTx("/v1/tx/initiate-unlock", { vault: vaultPubkey })}>
+            Initiate unlock (as guardian wallet)
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !unlockPk}
+            onClick={() => runTx("/v1/tx/approve-unlock", { vault: vaultPubkey, unlock: unlockPk })}
+          >
+            Approve unlock (as guardian wallet)
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !unlockPk}
+            onClick={() => runTx("/v1/tx/cancel-unlock", { vault: vaultPubkey, unlock: unlockPk })}
+          >
+            Cancel unlock (Owner)
+          </button>
+        </div>
+
+        <hr style={{ margin: "24px 0" }} />
+
+        <h4>Disputes (optional)</h4>
+        <Input label="noteHashHex (64 hex chars)" value={noteHashHex} onChange={setNoteHashHex} placeholder="..." />
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <button
+            disabled={!wallet.publicKey || !unlockPk || noteHashHex.length !== 64}
+            onClick={() => runTx("/v1/tx/open-dispute", { vault: vaultPubkey, unlock: unlockPk, noteHashHex })}
+          >
+            Open dispute
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !unlockPk}
+            onClick={() => runTx("/v1/tx/resolve-dispute-cancel", { vault: vaultPubkey, unlock: unlockPk })}
+          >
+            Resolve dispute: cancel (arbiter)
+          </button>
+
+          <button
+            disabled={!wallet.publicKey || !unlockPk}
+            onClick={() => runTx("/v1/tx/resolve-dispute-proceed", { vault: vaultPubkey, unlock: unlockPk })}
+          >
+            Resolve dispute: proceed (arbiter)
+          </button>
+        </div>
+      </Section>
+
+      <Section title="3) Distribute (after approvals + timelock)">
+        <p style={{ color: "#555" }}>
+          Distribution requires: unlock approved + timelock elapsed. This UI helps you run SOL + SPL batches and then finalize.
+        </p>
+
+        <h4>SOL</h4>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <button disabled={!wallet.publicKey || !unlockPk} onClick={() => runTx("/v1/tx/init-dist-sol", { vault: vaultPubkey, unlock: unlockPk })}>
+            Init SOL distribution session
+          </button>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
+          <Input label="startIndex" value={solStartIndex} onChange={setSolStartIndex} placeholder="0" />
+          <Input label="batchSize" value={solBatchSize} onChange={setSolBatchSize} placeholder="10" />
+        </div>
+
+        <button
+          disabled={!wallet.publicKey || !unlockPk}
+          onClick={() =>
+            runTx("/v1/tx/exec-dist-sol-batch", {
+              vault: vaultPubkey,
+              unlock: unlockPk,
+              startIndex: Number(solStartIndex),
+              batchSize: Number(solBatchSize)
+            })
+          }
+        >
+          Execute SOL batch
+        </button>
+
+        <hr style={{ margin: "24px 0" }} />
+
+        <h4>SPL</h4>
+        <button disabled={!wallet.publicKey} onClick={discoverVaultMints}>
+          Discover vault SPL mints
+        </button>
+
+        {discoveredMints.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 12, color: "#555" }}>Select mints to distribute:</div>
+            {discoveredMints.map((m) => (
+              <label key={m} style={{ display: "block", marginTop: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={selectedMints[m] ?? true}
+                  onChange={(e) => setSelectedMints({ ...selectedMints, [m]: e.target.checked })}
+                />
+                <code style={{ marginLeft: 8 }}>{m}</code>
+              </label>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
+          <Input label="SPL startIndex" value={splStartIndex} onChange={setSplStartIndex} placeholder="0" />
+          <Input label="SPL batchSize" value={splBatchSize} onChange={setSplBatchSize} placeholder="5" />
+        </div>
+
+        <label style={{ display: "block", marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            checked={createMissingAtas}
+            onChange={(e) => setCreateMissingAtas(e.target.checked)}
+          />
+          <span style={{ marginLeft: 8 }}>
+            Create missing beneficiary ATAs in the same tx (may hit tx size limits for large batches)
+          </span>
+        </label>
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {(discoveredMints.filter((m) => selectedMints[m])).slice(0, 6).map((mint) => (
+            <div key={mint} style={{ border: "1px solid #eee", borderRadius: 8, padding: 10 }}>
+              <div style={{ fontSize: 12, color: "#555" }}>Mint</div>
+              <code style={{ fontSize: 12 }}>{mint}</code>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                <button
+                  disabled={!wallet.publicKey || !unlockPk}
+                  onClick={() => runTx("/v1/tx/init-dist-spl", { vault: vaultPubkey, unlock: unlockPk, mint })}
+                >
+                  Init SPL session
+                </button>
+
+                <button
+                  disabled={!wallet.publicKey || !unlockPk}
+                  onClick={() =>
+                    runTx("/v1/tx/exec-dist-spl-batch", {
+                      vault: vaultPubkey,
+                      unlock: unlockPk,
+                      mint,
+                      startIndex: Number(splStartIndex),
+                      batchSize: Number(splBatchSize),
+                      createMissingAtas
+                    })
+                  }
+                >
+                  Exec SPL batch
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <hr style={{ margin: "24px 0" }} />
+
+        <h4>Finalize</h4>
+        <button
+          disabled={!wallet.publicKey || !unlockPk}
+          onClick={() => {
+            const splMints = discoveredMints.filter((m) => selectedMints[m]);
+            return runTx("/v1/tx/finalize-unlock", { vault: vaultPubkey, unlock: unlockPk, splMints });
+          }}
+        >
+          Finalize unlock (requires all dist sessions done)
+        </button>
+      </Section>
+    </div>
+  );
+}
+Patch: add /v1/vaults/:vault/full in API (needed by UI)
+TypeScript
+
+// api/src/routes/vaults.ts (add this handler)
+vaultsRouter.get("/:vaultPubkey/full", requireAuth, async (req: any, res) => {
+  const vault = await prisma.vault.findUnique({
+    where: { vaultPubkey: req.params.vaultPubkey },
+    include: {
+      guardians: true,
+      beneficiaries: true,
+      unlockSessions: {
+        orderBy: { createdAt: "desc" },
+        include: { approvalsRows: true, distSol: true, distSpl: true, dispute: true }
+      },
+      subscriptions: true
+    }
+  });
+  if (!vault) return res.status(404).json({ ok: false });
+  if (vault.ownerWallet !== req.user.wallet) return res.status(403).json({ ok: false });
+  res.json({ ok: true, vault });
+});
+What you should run next (so this works end-to-end)
+Add the missing Prisma models (Document, AssetRule) if you want those derived updates to compile; then:
+Bash
+
+pnpm -C db prisma migrate dev
+Boot stack:
+Bash
+
+docker compose up --build
+Go to http://localhost:3000, connect wallet, sign in, open a vault route.
+
+
+
