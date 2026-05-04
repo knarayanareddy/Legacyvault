@@ -9371,3 +9371,1008 @@ Go to http://localhost:3000, connect wallet, sign in, open a vault route.
 
 
 
+
+
+A) DB schema hardening (idempotency + cursors + richer read model)
+Add these models/fields to db/prisma/schema.prisma, then run pnpm -C db prisma migrate dev.
+
+1) Add indexing/idempotency tables
+prisma
+
+model IndexerCursor {
+  id        String   @id
+  lastSlot  BigInt   @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+model ProcessedTx {
+  signature   String   @id
+  slot        BigInt
+  processedAt DateTime @default(now())
+}
+2) (Recommended) enrich Vault with protocol settings (so UI doesn’t need chain reads)
+prisma
+
+model Vault {
+  id              String   @id @default(cuid())
+  vaultPubkey     String   @unique
+  ownerWallet     String
+  vaultIdU64      String?
+  status          String
+
+  // NEW (optional but recommended):
+  lastCheckinUnix        BigInt?
+  heartbeatIntervalSecs  Int?
+  inactivityThresholdSecs Int?
+  timelockSecs           Int?
+  guardianThreshold      Int?
+  panicEnabled           Boolean?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  guardians       Guardian[]
+  beneficiaries   Beneficiary[]
+  unlockSessions  UnlockSession[]
+  subscriptions   Subscription[]
+}
+3) (Recommended) add Document + AssetRule models if you want those derived-state upserts
+prisma
+
+model Document {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  docHashHex  String
+  uri         String?
+  uriLen      Int
+  tsUnix      BigInt
+  createdAt   DateTime @default(now())
+  @@unique([vaultId, docHashHex])
+}
+
+model AssetRule {
+  id                  String   @id @default(cuid())
+  vaultId             String
+  vault               Vault    @relation(fields: [vaultId], references: [id])
+  mint                String
+  mode                String
+  assignedBeneficiary String
+  tsUnix              BigInt
+  updatedAt           DateTime @updatedAt
+  @@unique([vaultId, mint])
+}
+B) Indexer production-hardening
+B1) Replace indexer/src/handlers/derivedState.ts with this hardened version
+Key upgrades:
+
+Idempotency: skip re-applying derived state for tx signatures already processed (ProcessedTx)
+Auto-create vault/unlock rows from any event (even if VaultCreated missed)
+Hydrate missing state from chain (vault + unlock + dist sessions) when needed
+Cursor support for deterministic backfill
+TypeScript
+
+// indexer/src/handlers/derivedState.ts
+import { PublicKey } from "@solana/web3.js";
+import { prisma } from "../db";
+import { program } from "../anchor";
+
+type AnchorEvent = { name: string; data: any };
+
+function pkToStr(x: any): string {
+  if (!x) return "";
+  if (typeof x === "string") return x;
+  if (x instanceof PublicKey) return x.toBase58();
+  if (typeof x?.toBase58 === "function") return x.toBase58();
+  return String(x);
+}
+function toBigInt(x: any): bigint {
+  if (x === null || x === undefined) return 0n;
+  if (typeof x === "bigint") return x;
+  if (typeof x === "number") return BigInt(Math.trunc(x));
+  if (typeof x === "string") return BigInt(x);
+  if (typeof x?.toString === "function") return BigInt(x.toString());
+  return 0n;
+}
+function toNumber(x: any): number {
+  if (x === null || x === undefined) return 0;
+  if (typeof x === "number") return x;
+  if (typeof x === "bigint") return Number(x);
+  if (typeof x === "string") return Number(x);
+  if (typeof x?.toString === "function") return Number(x.toString());
+  return 0;
+}
+function field<T = any>(obj: any, ...names: string[]): T | undefined {
+  for (const n of names) if (obj && Object.prototype.hasOwnProperty.call(obj, n)) return obj[n];
+  return undefined;
+}
+
+// ------------ chain hydration (best-effort) ------------
+
+async function hydrateVaultFromChain(vaultPubkey: string) {
+  try {
+    const vaultPk = new PublicKey(vaultPubkey);
+    const acc: any = await program.account.vault.fetchNullable(vaultPk);
+    if (!acc) return null;
+    return {
+      ownerWallet: pkToStr(acc.owner),
+      vaultIdU64: acc.vaultId?.toString?.() ?? acc.vaultId?.toString() ?? null,
+      status: String(acc.status ?? "Unknown"),
+      lastCheckinUnix: BigInt(acc.lastCheckinUnix?.toString?.() ?? "0"),
+      heartbeatIntervalSecs: Number(acc.heartbeatIntervalSecs ?? 0),
+      inactivityThresholdSecs: Number(acc.inactivityThresholdSecs ?? 0),
+      timelockSecs: Number(acc.timelockSecs ?? 0),
+      guardianThreshold: Number(acc.guardianThreshold ?? 0),
+      panicEnabled: Boolean(acc.panicEnabled ?? false)
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function hydrateUnlockFromChain(unlockPubkey: string) {
+  try {
+    const upk = new PublicKey(unlockPubkey);
+    const acc: any = await program.account.unlockSession.fetchNullable(upk);
+    if (!acc) return null;
+    return {
+      vaultPubkey: pkToStr(acc.vault),
+      nonceU64: acc.nonce?.toString?.() ?? String(acc.nonce ?? "0"),
+      status: String(acc.status ?? "Unknown"),
+      initiatedBy: pkToStr(acc.initiatedBy),
+      initiatedAtUnix: BigInt(acc.initiatedAtUnix?.toString?.() ?? "0"),
+      approvals: Number(acc.approvals ?? 0),
+      threshold: Number(acc.threshold ?? 0),
+      approvedAtUnix: BigInt(acc.approvedAtUnix?.toString?.() ?? "0"),
+      executableAtUnix: BigInt(acc.executableAtUnix?.toString?.() ?? "0")
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ------------ resolvers (auto-create) ------------
+
+async function ensureVault(tx: any, vaultPubkey: string, hintOwner?: string) {
+  let v = await tx.vault.findUnique({ where: { vaultPubkey } });
+  if (v) return v;
+
+  // create placeholder; fill with hintOwner if available
+  v = await tx.vault.create({
+    data: {
+      vaultPubkey,
+      ownerWallet: hintOwner ?? "unknown",
+      vaultIdU64: null,
+      status: "Unknown"
+    }
+  });
+
+  // hydrate best-effort immediately
+  const hydrated = await hydrateVaultFromChain(vaultPubkey);
+  if (hydrated) {
+    v = await tx.vault.update({
+      where: { id: v.id },
+      data: {
+        ownerWallet: hydrated.ownerWallet ?? v.ownerWallet,
+        vaultIdU64: hydrated.vaultIdU64 ?? v.vaultIdU64,
+        status: hydrated.status ?? v.status,
+        lastCheckinUnix: hydrated.lastCheckinUnix,
+        heartbeatIntervalSecs: hydrated.heartbeatIntervalSecs,
+        inactivityThresholdSecs: hydrated.inactivityThresholdSecs,
+        timelockSecs: hydrated.timelockSecs,
+        guardianThreshold: hydrated.guardianThreshold,
+        panicEnabled: hydrated.panicEnabled
+      }
+    });
+  }
+
+  return v;
+}
+
+async function ensureUnlock(tx: any, unlockPubkey: string, vaultId: string, nonceU64?: string) {
+  let u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+  if (u) return u;
+
+  u = await tx.unlockSession.create({
+    data: {
+      unlockPubkey,
+      vaultId,
+      nonceU64: nonceU64 ?? "0",
+      status: "Unknown",
+      initiatedBy: "unknown",
+      initiatedAtUnix: 0n,
+      approvals: 0,
+      threshold: 0,
+      approvedAtUnix: null,
+      executableAtUnix: null
+    }
+  });
+
+  // best-effort hydrate
+  const hydrated = await hydrateUnlockFromChain(unlockPubkey);
+  if (hydrated) {
+    // ensure referenced vault exists and link if mismatch
+    const chainVault = await ensureVault(tx, hydrated.vaultPubkey);
+    u = await tx.unlockSession.update({
+      where: { id: u.id },
+      data: {
+        vaultId: chainVault.id,
+        nonceU64: hydrated.nonceU64,
+        status: hydrated.status,
+        initiatedBy: hydrated.initiatedBy,
+        initiatedAtUnix: hydrated.initiatedAtUnix,
+        approvals: hydrated.approvals,
+        threshold: hydrated.threshold,
+        approvedAtUnix: hydrated.approvedAtUnix ? hydrated.approvedAtUnix : null,
+        executableAtUnix: hydrated.executableAtUnix ? hydrated.executableAtUnix : null
+      }
+    });
+  }
+
+  return u;
+}
+
+export async function applyDerivedStateFromEvents(args: {
+  signature: string;
+  slot: bigint;
+  blockTime?: bigint | null;
+  programId: string;
+  events: AnchorEvent[];
+}) {
+  await prisma.$transaction(async (tx) => {
+    // Idempotency gate (skip derived-state reapply if we already processed this signature)
+    const processed = await tx.processedTx.findUnique({ where: { signature: args.signature } });
+    if (processed) return;
+
+    // Mark processed early; if txn fails, entire tx rolls back (good).
+    await tx.processedTx.create({
+      data: { signature: args.signature, slot: args.slot }
+    });
+
+    for (const evt of args.events) {
+      const d = evt.data ?? {};
+      const tsUnix = toBigInt(field(d, "ts", "timestamp", "tsUnix") ?? 0);
+
+      switch (evt.name) {
+        // -------------
+        // VaultCreated / vault lifecycle
+        // -------------
+        case "VaultCreated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const ownerWallet = pkToStr(field(d, "owner"));
+          const vaultIdU64 = toBigInt(field(d, "vaultId", "vault_id") ?? 0).toString();
+
+          await tx.vault.upsert({
+            where: { vaultPubkey },
+            create: { vaultPubkey, ownerWallet, vaultIdU64, status: "Active" },
+            update: { ownerWallet, vaultIdU64, status: "Active" }
+          });
+
+          // also seed cursor row if missing (optional)
+          await tx.indexerCursor.upsert({
+            where: { id: "legacyvault" },
+            create: { id: "legacyvault", lastSlot: args.slot },
+            update: { lastSlot: args.slot }
+          });
+
+          break;
+        }
+
+        case "PanicFrozen": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { status: "Frozen" } });
+          break;
+        }
+
+        case "Unfrozen": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { status: "Active" } });
+          break;
+        }
+
+        case "DocumentSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const v = await ensureVault(tx, vaultPubkey);
+
+          const docHash = field(d, "docHash", "doc_hash") as any;
+          const docHashHex = docHash ? Buffer.from(docHash).toString("hex") : "";
+          const uriLen = toNumber(field(d, "docUriLen", "doc_uri_len") ?? 0);
+
+          if ((tx as any).document) {
+            await (tx as any).document.upsert({
+              where: { vaultId_docHashHex: { vaultId: v.id, docHashHex } },
+              create: { vaultId: v.id, docHashHex, uri: null, uriLen, tsUnix },
+              update: { uriLen, tsUnix }
+            });
+          }
+          break;
+        }
+
+        // -------------
+        // Guardians / Beneficiaries
+        // -------------
+        case "GuardianAdded": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const guardian = pkToStr(field(d, "guardian"));
+          const role = String(field(d, "role") ?? "Personal");
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.guardian.upsert({
+            where: { vaultId_guardian: { vaultId: v.id, guardian } },
+            create: { vaultId: v.id, guardian, role, active: true },
+            update: { role, active: true }
+          });
+          break;
+        }
+
+        case "GuardianRemoved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const guardian = pkToStr(field(d, "guardian"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.guardian.updateMany({ where: { vaultId: v.id, guardian }, data: { active: false } });
+          break;
+        }
+
+        case "GuardianThresholdSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const threshold = toNumber(field(d, "threshold") ?? 0);
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { guardianThreshold: threshold } });
+          break;
+        }
+
+        case "BeneficiaryAdded": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+          const shareBps = toNumber(field(d, "shareBps", "share_bps") ?? 0);
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.beneficiary.upsert({
+            where: { vaultId_beneficiary: { vaultId: v.id, beneficiary } },
+            create: { vaultId: v.id, beneficiary, shareBps, label: null, active: true },
+            update: { shareBps, active: true }
+          });
+          break;
+        }
+
+        case "BeneficiaryUpdated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+          const shareBps = toNumber(field(d, "shareBps", "share_bps") ?? 0);
+          const active = Boolean(field(d, "active") ?? true);
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.beneficiary.upsert({
+            where: { vaultId_beneficiary: { vaultId: v.id, beneficiary } },
+            create: { vaultId: v.id, beneficiary, shareBps, label: null, active },
+            update: { shareBps, active }
+          });
+          break;
+        }
+
+        case "BeneficiaryRemoved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const beneficiary = pkToStr(field(d, "beneficiary"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.beneficiary.updateMany({ where: { vaultId: v.id, beneficiary }, data: { active: false } });
+          break;
+        }
+
+        // -------------
+        // Asset rules
+        // -------------
+        case "AssetRuleSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const mint = pkToStr(field(d, "mint"));
+          const mode = String(field(d, "mode") ?? "ProRata");
+          const assignedBeneficiary = pkToStr(field(d, "assignedBeneficiary", "assigned_beneficiary"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          if ((tx as any).assetRule) {
+            await (tx as any).assetRule.upsert({
+              where: { vaultId_mint: { vaultId: v.id, mint } },
+              create: { vaultId: v.id, mint, mode, assignedBeneficiary, tsUnix },
+              update: { mode, assignedBeneficiary, tsUnix }
+            });
+          }
+          break;
+        }
+
+        // -------------
+        // Check-ins
+        // -------------
+        case "CheckIn": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { lastCheckinUnix: tsUnix } });
+          break;
+        }
+
+        // -------------
+        // Unlock lifecycle
+        // -------------
+        case "UnlockInitiated": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const nonceU64 = toBigInt(field(d, "nonce") ?? 0).toString();
+          const initiatedBy = pkToStr(field(d, "initiatedBy", "initiated_by"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { status: "Unlocking" } });
+
+          await tx.unlockSession.upsert({
+            where: { unlockPubkey },
+            create: {
+              unlockPubkey,
+              vaultId: v.id,
+              nonceU64,
+              status: "Proposed",
+              initiatedBy,
+              initiatedAtUnix: tsUnix,
+              approvals: 0,
+              threshold: 0,
+              approvedAtUnix: null,
+              executableAtUnix: null
+            },
+            update: {
+              vaultId: v.id,
+              nonceU64,
+              status: "Proposed",
+              initiatedBy,
+              initiatedAtUnix: tsUnix
+            }
+          });
+          break;
+        }
+
+        case "UnlockApproved": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const guardian = pkToStr(field(d, "guardian"));
+          const approvals = toNumber(field(d, "approvals") ?? 0);
+          const threshold = toNumber(field(d, "threshold") ?? 0);
+
+          const v = await ensureVault(tx, vaultPubkey);
+          const u = await ensureUnlock(tx, unlockPubkey, v.id);
+
+          await tx.unlockSession.update({
+            where: { id: u.id },
+            data: {
+              approvals,
+              threshold,
+              status: approvals >= threshold && threshold > 0 ? "Approved" : "Proposed"
+            }
+          });
+
+          await tx.approval.upsert({
+            where: { unlockId_guardian: { unlockId: u.id, guardian } },
+            create: { unlockId: u.id, guardian, approvedAtUnix: tsUnix },
+            update: { approvedAtUnix: tsUnix }
+          });
+          break;
+        }
+
+        case "UnlockCancelled": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { status: "Active" } });
+
+          await tx.unlockSession.updateMany({ where: { unlockPubkey }, data: { status: "Cancelled" } });
+          break;
+        }
+
+        // -------------
+        // Disputes
+        // -------------
+        case "DisputeOpened": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const openedBy = pkToStr(field(d, "openedBy", "opened_by"));
+          const noteHash = field(d, "noteHash", "note_hash") as any;
+          const noteHashHex = noteHash ? Buffer.from(noteHash).toString("hex") : "";
+
+          // hydrate unlock (need vault link)
+          const hydrated = await hydrateUnlockFromChain(unlockPubkey);
+          const v = hydrated ? await ensureVault(tx, hydrated.vaultPubkey) : null;
+          const u = v ? await ensureUnlock(tx, unlockPubkey, v.id) : await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+
+          if (u) {
+            await tx.unlockSession.update({ where: { id: u.id }, data: { status: "Disputed" } });
+
+            await tx.disputeCase.upsert({
+              where: { unlockId: u.id },
+              create: { unlockId: u.id, status: "Open", openedBy, openedAtUnix: tsUnix, noteHashHex },
+              update: { status: "Open", openedBy, openedAtUnix: tsUnix, noteHashHex }
+            });
+          }
+          break;
+        }
+
+        case "DisputeResolved": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const status = String(field(d, "status") ?? "ResolvedProceed");
+
+          const u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (u) {
+            await tx.disputeCase.updateMany({ where: { unlockId: u.id }, data: { status, resolvedAt: new Date() } });
+            if (status.includes("Cancel")) {
+              await tx.unlockSession.update({ where: { id: u.id }, data: { status: "Cancelled" } });
+              const v = await tx.vault.findUnique({ where: { id: u.vaultId } });
+              if (v) await tx.vault.update({ where: { id: v.id }, data: { status: "Active" } });
+            }
+          }
+          break;
+        }
+
+        // -------------
+        // Distributions
+        // -------------
+        case "SolDistributionInitialized": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const totalDistributable = toBigInt(field(d, "totalDistributable", "total_distributable") ?? 0);
+
+          const u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (u) {
+            await tx.distributionSolSession.upsert({
+              where: { unlockId: u.id },
+              create: { unlockId: u.id, totalDistributable, paidTotal: 0n, cursor: 0, done: totalDistributable === 0n },
+              update: { totalDistributable }
+            });
+          }
+          break;
+        }
+
+        case "SolDistributionBatchExecuted": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const newCursor = toNumber(field(d, "newCursor", "new_cursor") ?? 0);
+
+          const u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (u) {
+            await tx.distributionSolSession.updateMany({ where: { unlockId: u.id }, data: { cursor: newCursor } });
+          }
+          break;
+        }
+
+        case "SplDistributionInitialized": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const mint = pkToStr(field(d, "mint"));
+          const totalBalance = toBigInt(field(d, "totalBalance", "total_balance") ?? 0);
+
+          const u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (u) {
+            await tx.distributionSplSession.upsert({
+              where: { unlockId_mint: { unlockId: u.id, mint } },
+              create: { unlockId: u.id, mint, totalBalance, paidTotal: 0n, cursor: 0, done: totalBalance === 0n },
+              update: { totalBalance }
+            });
+          }
+          break;
+        }
+
+        case "SplDistributionBatchExecuted": {
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+          const mint = pkToStr(field(d, "mint"));
+          const newCursor = toNumber(field(d, "newCursor", "new_cursor") ?? 0);
+          const done = Boolean(field(d, "done") ?? false);
+
+          const u = await tx.unlockSession.findUnique({ where: { unlockPubkey } });
+          if (u) {
+            await tx.distributionSplSession.updateMany({ where: { unlockId: u.id, mint }, data: { cursor: newCursor, done } });
+          }
+          break;
+        }
+
+        case "UnlockFinalized": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const unlockPubkey = pkToStr(field(d, "unlock"));
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.vault.update({ where: { id: v.id }, data: { status: "Distributed" } });
+          await tx.unlockSession.updateMany({ where: { unlockPubkey }, data: { status: "Executed" } });
+          break;
+        }
+
+        // -------------
+        // Subscription / pro guardian
+        // -------------
+        case "SubscriptionSet": {
+          const vaultPubkey = pkToStr(field(d, "vault"));
+          const planId = toNumber(field(d, "planId", "plan_id") ?? 0);
+          const validUntilUnix = toBigInt(field(d, "validUntilUnix", "valid_until_unix") ?? 0);
+
+          const v = await ensureVault(tx, vaultPubkey);
+          await tx.subscription.upsert({
+            where: { vaultId_planId: { vaultId: v.id, planId } },
+            create: { vaultId: v.id, planId, validUntilUnix },
+            update: { validUntilUnix }
+          });
+          break;
+        }
+
+        case "GuardianProfileRegistered": {
+          const guardian = pkToStr(field(d, "guardian"));
+          await tx.guardianProfile.upsert({
+            where: { guardian },
+            create: { guardian, displayName: null, websiteUri: null, kycLevel: 0, active: true },
+            update: {}
+          });
+          break;
+        }
+
+        case "GuardianBondUpdated": {
+          const guardian = pkToStr(field(d, "guardian"));
+          const amount = toBigInt(field(d, "amount") ?? 0);
+          const locked = Boolean(field(d, "locked") ?? false);
+
+          await tx.guardianBond.upsert({
+            where: { guardian },
+            create: { guardian, amount, locked },
+            update: { amount, locked }
+          });
+          break;
+        }
+
+        default:
+          break;
+      }
+    }
+
+    // advance cursor monotonically
+    await tx.indexerCursor.upsert({
+      where: { id: "legacyvault" },
+      create: { id: "legacyvault", lastSlot: args.slot },
+      update: { lastSlot: args.slot }
+    });
+  });
+}
+B2) Add chain backfill: indexer/src/backfill.ts
+This backfills transactions that invoked your program by walking signatures for the program id address, skipping signatures already in ProcessedTx.
+
+TypeScript
+
+// indexer/src/backfill.ts
+import { connection, programId } from "./anchor";
+import { decodeAnchorEvents } from "./decode";
+import { persistEvents } from "./handlers/eventsToDb";
+import { prisma } from "./db";
+
+export async function backfillOnce(args: { limit: number }) {
+  const cursor = await prisma.indexerCursor.upsert({
+    where: { id: "legacyvault" },
+    create: { id: "legacyvault", lastSlot: 0n },
+    update: {}
+  });
+
+  // We backfill by signatures; slot cursor used only for progress reporting.
+  // Fetch recent signatures for the program id.
+  const sigs = await connection.getSignaturesForAddress(programId, { limit: args.limit }, "confirmed");
+
+  // Process oldest first for more natural state progression
+  sigs.reverse();
+
+  let processed = 0;
+  for (const s of sigs) {
+    const signature = s.signature;
+
+    const already = await prisma.processedTx.findUnique({ where: { signature } });
+    if (already) continue;
+
+    const tx = await connection.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0
+    });
+    if (!tx?.meta?.logMessages) continue;
+
+    const events = decodeAnchorEvents(tx.meta.logMessages);
+    if (events.length === 0) {
+      // still mark as processed to avoid refetch loops if desired:
+      // await prisma.processedTx.create({ data: { signature, slot: BigInt(s.slot ?? 0) } });
+      continue;
+    }
+
+    await persistEvents({
+      signature,
+      slot: BigInt(s.slot ?? 0),
+      programId: programId.toBase58(),
+      blockTime: tx.blockTime ? BigInt(tx.blockTime) : null,
+      events
+    });
+
+    processed++;
+  }
+
+  // update slot cursor to max seen
+  const maxSlot = sigs.reduce((m, x) => Math.max(m, x.slot ?? 0), 0);
+  await prisma.indexerCursor.update({ where: { id: "legacyvault" }, data: { lastSlot: BigInt(maxSlot) } });
+
+  return { processed, fetched: sigs.length, lastSlot: maxSlot };
+}
+B3) Patch indexer/src/env.ts and indexer/src/main.ts to enable backfill on boot
+Add to indexer/src/env.ts:
+
+TypeScript
+
+// add these fields to the zod schema
+INDEXER_BACKFILL_ON_BOOT: z.string().default("false"),
+INDEXER_BACKFILL_LIMIT: z.string().default("200")
+Patch indexer/src/main.ts:
+
+TypeScript
+
+import { backfillOnce } from "./backfill";
+
+// inside main() after server starts:
+if (env.INDEXER_BACKFILL_ON_BOOT === "true") {
+  const limit = Number(env.INDEXER_BACKFILL_LIMIT);
+  backfillOnce({ limit }).then((r) => {
+    console.log("[indexer] backfill complete", r);
+  }).catch(console.error);
+}
+C) API “distribution wizard endpoint” (single plan with progress cursors)
+Add this route to the bottom of api/src/routes/tx.ts. It returns a plan made of “steps” that reference your existing tx-builder endpoints, but it also includes progress cursors (from on-chain dist sessions when present), so clients can resume.
+
+C1) Add helper: mint discovery (server-side, Token + Token-2022)
+At top of api/src/routes/tx.ts, add:
+
+TypeScript
+
+import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+Add this helper somewhere in tx.ts:
+
+TypeScript
+
+async function discoverVaultHoldingsMints(vaultAuth: PublicKey) {
+  const out: Array<{ mint: string; programId: string; amount: string; decimals: number; uiAmountString: string }> = [];
+
+  for (const pid of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    const parsed = await connection.getParsedTokenAccountsByOwner(vaultAuth, { programId: pid }, "confirmed");
+    for (const acc of parsed.value) {
+      const info: any = acc.account.data?.parsed?.info;
+      if (!info) continue;
+      const amount = info.tokenAmount?.amount as string;
+      const decimals = info.tokenAmount?.decimals as number;
+      const uiAmountString = info.tokenAmount?.uiAmountString as string;
+      if (!amount || amount === "0") continue;
+      out.push({ mint: info.mint, programId: pid.toBase58(), amount, decimals, uiAmountString });
+    }
+  }
+
+  // collapse by mint (prefer token-2022 if duplicated; unlikely)
+  const map = new Map<string, any>();
+  for (const r of out) map.set(r.mint, r);
+  return Array.from(map.values());
+}
+C2) Add the wizard endpoint
+TypeScript
+
+// POST /v1/tx/distribution-plan
+txRouter.post("/distribution-plan", requireAuth, express.json(), async (req: any, res) => {
+  const Body = z.object({
+    vault: PubkeyStr,
+    unlock: PubkeyStr,
+    solBatchSize: z.number().int().min(1).max(25).default(10),
+    splBatchSize: z.number().int().min(1).max(10).default(5),
+
+    // optional: if provided, we plan for these mints only; else we discover from vault holdings
+    mints: z.array(PubkeyStr).optional()
+  });
+  const body = Body.parse(req.body);
+
+  const requester = pk(req.user.wallet);
+  const vault = pk(body.vault);
+  const unlock = pk(body.unlock);
+
+  const [cfg] = pdas.configPda(program.programId);
+  const [index] = pdas.indexPda(program.programId, vault);
+
+  const idxAcc: any = await program.account.vaultIndex.fetch(index);
+  const beneficiaries: PublicKey[] = idxAcc.beneficiaries;
+  const total = beneficiaries.length;
+
+  const [vaultAuth] = pdas.vaultAuthPda(program.programId, vault);
+
+  // ---------- SOL dist session progress ----------
+  const [distSol] = pdas.distSolPda(program.programId, unlock);
+  const distSolAcc: any = await program.account.distributionSolSession.fetchNullable(distSol);
+
+  const solCursor = distSolAcc ? Number(distSolAcc.cursor ?? 0) : 0;
+  const solDone = distSolAcc ? Boolean(distSolAcc.done ?? false) : false;
+
+  const steps: any[] = [];
+
+  if (!distSolAcc) {
+    steps.push({ name: "init-dist-sol", endpoint: "/v1/tx/init-dist-sol", body: { vault: vault.toBase58(), unlock: unlock.toBase58() } });
+  }
+
+  if (!solDone) {
+    for (let start = solCursor; start < total; start += body.solBatchSize) {
+      const bs = Math.min(body.solBatchSize, total - start);
+      steps.push({
+        name: `exec-dist-sol-batch:${start}`,
+        endpoint: "/v1/tx/exec-dist-sol-batch",
+        body: { vault: vault.toBase58(), unlock: unlock.toBase58(), startIndex: start, batchSize: bs }
+      });
+    }
+  }
+
+  // ---------- SPL mints to distribute ----------
+  const mints = body.mints?.length
+    ? body.mints.map(pk)
+    : (await discoverVaultHoldingsMints(vaultAuth)).map((x) => new PublicKey(x.mint));
+
+  const splPlans: any[] = [];
+  for (const mint of mints) {
+    const [distSpl] = pdas.distSplPda(program.programId, unlock, mint);
+    const distSplAcc: any = await program.account.distributionSplSession.fetchNullable(distSpl);
+
+    const cursor = distSplAcc ? Number(distSplAcc.cursor ?? 0) : 0;
+    const done = distSplAcc ? Boolean(distSplAcc.done ?? false) : false;
+
+    const mintSteps: any[] = [];
+
+    if (!distSplAcc) {
+      mintSteps.push({
+        name: `init-dist-spl:${mint.toBase58()}`,
+        endpoint: "/v1/tx/init-dist-spl",
+        body: { vault: vault.toBase58(), unlock: unlock.toBase58(), mint: mint.toBase58() }
+      });
+    }
+
+    if (!done) {
+      for (let start = cursor; start < total; start += body.splBatchSize) {
+        const bs = Math.min(body.splBatchSize, total - start);
+        mintSteps.push({
+          name: `exec-dist-spl-batch:${mint.toBase58()}:${start}`,
+          endpoint: "/v1/tx/exec-dist-spl-batch",
+          body: {
+            vault: vault.toBase58(),
+            unlock: unlock.toBase58(),
+            mint: mint.toBase58(),
+            startIndex: start,
+            batchSize: bs,
+            createMissingAtas: false
+          }
+        });
+      }
+    }
+
+    splPlans.push({
+      mint: mint.toBase58(),
+      distSpl: distSpl.toBase58(),
+      cursor,
+      done,
+      steps: mintSteps
+    });
+  }
+
+  // ---------- Finalize step (requires dist_spl PDAs) ----------
+  const splMints = splPlans.map(p => p.mint);
+  steps.push({
+    name: "finalize-unlock",
+    endpoint: "/v1/tx/finalize-unlock",
+    body: { vault: vault.toBase58(), unlock: unlock.toBase58(), splMints }
+  });
+
+  res.json({
+    ok: true,
+    vault: vault.toBase58(),
+    unlock: unlock.toBase58(),
+    totals: { beneficiaries: total },
+    progress: {
+      sol: { distSol: distSol.toBase58(), cursor: solCursor, done: solDone },
+      spl: splPlans.map(p => ({ mint: p.mint, distSpl: p.distSpl, cursor: p.cursor, done: p.done }))
+    },
+    plan: {
+      steps,
+      splPlans
+    }
+  });
+});
+How clients use it:
+
+Call /v1/tx/distribution-plan to get an ordered list of steps.
+For each step: call endpoint with body to get a fresh unsigned tx (with a fresh blockhash), sign+send, then continue.
+This avoids the “blockhash expires” problem while still giving you one “wizard plan”.
+
+D) Web UI: mint/balance-aware SPL discovery (Token + Token-2022, filters 0 balances)
+D1) Add helper: web/src/lib/discovery.ts
+TypeScript
+
+// web/src/lib/discovery.ts
+import { Connection, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+export type TokenHolding = {
+  mint: string;
+  programId: string; // token program id (classic or token-2022)
+  amount: string;    // raw string
+  decimals: number;
+  uiAmountString: string;
+};
+
+export async function discoverTokenHoldingsByOwner(connection: Connection, owner: PublicKey): Promise<TokenHolding[]> {
+  const holdings: TokenHolding[] = [];
+
+  for (const pid of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    const parsed = await connection.getParsedTokenAccountsByOwner(owner, { programId: pid }, "confirmed");
+    for (const acc of parsed.value) {
+      const info: any = acc.account.data?.parsed?.info;
+      const tokenAmount = info?.tokenAmount;
+      if (!info?.mint || !tokenAmount?.amount) continue;
+      if (tokenAmount.amount === "0") continue;
+
+      holdings.push({
+        mint: info.mint,
+        programId: pid.toBase58(),
+        amount: tokenAmount.amount,
+        decimals: tokenAmount.decimals,
+        uiAmountString: tokenAmount.uiAmountString ?? String(tokenAmount.uiAmount ?? "")
+      });
+    }
+  }
+
+  // dedupe by mint
+  const map = new Map<string, TokenHolding>();
+  for (const h of holdings) map.set(h.mint, h);
+  return Array.from(map.values());
+}
+D2) Patch /vault/[vault]/page.tsx SPL discovery to use it
+At top:
+
+React
+
+import { discoverTokenHoldingsByOwner, type TokenHolding } from "../../../lib/discovery";
+import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+Replace your discoverVaultMints() implementation with:
+
+React
+
+  const [holdings, setHoldings] = useState<TokenHolding[]>([]);
+
+  async function discoverVaultMints() {
+    const vault = new PublicKey(vaultPubkey);
+    const [vaultAuth] = pdas.vaultAuthPda(programId, vault);
+
+    const hs = await discoverTokenHoldingsByOwner(connection, vaultAuth);
+
+    // optional: filter out obvious NFTs if you want (uiAmountString === "1" and decimals === 0)
+    // const filtered = hs.filter(h => !(h.decimals === 0 && h.uiAmountString === "1"));
+    const filtered = hs;
+
+    setHoldings(filtered);
+
+    const mintList = filtered.map(h => h.mint);
+    setDiscoveredMints(mintList);
+
+    const sel: Record<string, boolean> = {};
+    for (const m of mintList) sel[m] = selectedMints[m] ?? true;
+    setSelectedMints(sel);
+  }
+Update your mint display block to show balances + token program:
+
+React
+
+{holdings.length > 0 && (
+  <div style={{ marginTop: 12 }}>
+    <div style={{ fontSize: 12, color: "#555" }}>Select mints to distribute (non-zero balances):</div>
+    {holdings.map((h) => (
+      <label key={h.mint} style={{ display: "block", marginTop: 6 }}>
+        <input
+          type="checkbox"
+          checked={selectedMints[h.mint] ?? true}
+          onChange={(e) => setSelectedMints({ ...selectedMints, [h.mint]: e.target.checked })}
+        />
+        <code style={{ marginLeft: 8 }}>{h.mint}</code>
+        <span style={{ marginLeft: 10, fontSize: 12, color: "#444" }}>
+          balance: {h.uiAmountString} (decimals {h.decimals}) · program:{" "}
+          {h.programId === TOKEN_2022_PROGRAM_ID.toBase58() ? "Token-2022" : "Token"}
+        </span>
+      </label>
+    ))}
+  </div>
+)}
