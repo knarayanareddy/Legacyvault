@@ -1,0 +1,191 @@
+{
+  "version": "0.1.0",
+  "name": "legacyvault",
+  "instructions": [
+    {
+      "name": "initializeConfig",
+      "accounts": [
+        { "name": "config", "isMut": true, "isSigner": false },
+        { "name": "admin", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "createFeeLamports", "type": "u64" },
+        { "name": "minHeartbeatSecs", "type": "u32" },
+        { "name": "maxHeartbeatSecs", "type": "u32" },
+        { "name": "minInactivitySecs", "type": "u32" },
+        { "name": "maxInactivitySecs", "type": "u32" },
+        { "name": "minTimelockSecs", "type": "u32" },
+        { "name": "maxTimelockSecs", "type": "u32" }
+      ]
+    },
+    {
+      "name": "createVault",
+      "accounts": [
+        { "name": "config", "isMut": false, "isSigner": false },
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "owner", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "vaultId", "type": "u64" },
+        { "name": "heartbeatIntervalSecs", "type": "u32" },
+        { "name": "inactivityThresholdSecs", "type": "u32" },
+        { "name": "timelockSecs", "type": "u32" }
+      ]
+    },
+    {
+      "name": "addGuardian",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "guardianEntry", "isMut": true, "isSigner": false },
+        { "name": "guardian", "isMut": false, "isSigner": false },
+        { "name": "owner", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "role", "type": { "defined": "GuardianRole" } }
+      ]
+    },
+    {
+      "name": "addBeneficiary",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "beneficiaryEntry", "isMut": true, "isSigner": false },
+        { "name": "beneficiary", "isMut": false, "isSigner": false },
+        { "name": "owner", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "shareBps", "type": "u16" },
+        { "name": "label", "type": { "array": ["u8", 16] } }
+      ]
+    },
+    {
+      "name": "checkIn",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "owner", "isMut": false, "isSigner": true }
+      ],
+      "args": []
+    },
+    {
+      "name": "initiateUnlock",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "unlockSession", "isMut": true, "isSigner": false },
+        { "name": "guardianEntry", "isMut": false, "isSigner": false },
+        { "name": "guardian", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": []
+    },
+    {
+      "name": "approveUnlock",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "unlockSession", "isMut": true, "isSigner": false },
+        { "name": "approval", "isMut": true, "isSigner": false },
+        { "name": "guardianEntry", "isMut": false, "isSigner": false },
+        { "name": "guardian", "isMut": true, "isSigner": true },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancelUnlock",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "unlockSession", "isMut": true, "isSigner": false },
+        { "name": "owner", "isMut": false, "isSigner": true }
+      ],
+      "args": []
+    },
+    {
+      "name": "panicFreeze",
+      "accounts": [
+        { "name": "vault", "isMut": true, "isSigner": false },
+        { "name": "owner", "isMut": false, "isSigner": true }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "admin", "type": "publicKey" },
+          { "name": "paused", "type": "bool" },
+          { "name": "treasury", "type": "publicKey" },
+          { "name": "createFeeLamports", "type": "u64" },
+          { "name": "minHeartbeatSecs", "type": "u32" },
+          { "name": "maxHeartbeatSecs", "type": "u32" },
+          { "name": "minInactivitySecs", "type": "u32" },
+          { "name": "maxInactivitySecs", "type": "u32" },
+          { "name": "minTimelockSecs", "type": "u32" },
+          { "name": "maxTimelockSecs", "type": "u32" },
+          { "name": "arbiter", "type": "publicKey" },
+          { "name": "version", "type": "u16" }
+        ]
+      }
+    },
+    {
+      "name": "Vault",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "vaultId", "type": "u64" },
+          { "name": "owner", "type": "publicKey" },
+          { "name": "createdAtUnix", "type": "i64" },
+          { "name": "lastCheckinUnix", "type": "i64" },
+          { "name": "heartbeatIntervalSecs", "type": "u32" },
+          { "name": "inactivityThresholdSecs", "type": "u32" },
+          { "name": "timelockSecs", "type": "u32" },
+          { "name": "status", "type": { "defined": "VaultStatus" } },
+          { "name": "guardianThreshold", "type": "u8" },
+          { "name": "guardiansCount", "type": "u16" },
+          { "name": "beneficiariesCount", "type": "u16" },
+          { "name": "currentNonce", "type": "u64" },
+          { "name": "panicEnabled", "type": "bool" },
+          { "name": "docHash", "type": { "array": ["u8", 32] } },
+          { "name": "docUriLen", "type": "u16" },
+          { "name": "docUri", "type": { "array": ["u8", 200] } },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "VaultStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "Active" },
+          { "name": "Unlocking" },
+          { "name": "Distributed" },
+          { "name": "Frozen" },
+          { "name": "Closed" }
+        ]
+      }
+    },
+    {
+      "name": "GuardianRole",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          { "name": "Personal" },
+          { "name": "Professional" }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    { "code": 6000, "name": "Unauthorized", "msg": "Unauthorized access" }
+  ],
+  "metadata": {
+    "address": "C7xKXk7yP7yP7yP7yP7yP7yP7yP7yP7yP7yP7yP7yP"
+  }
+}

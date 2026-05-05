@@ -1,0 +1,7 @@
+packages:
+  - "db"
+  - "sdk"
+  - "api"
+  - "indexer"
+  - "notifier"
+  - "web"

@@ -1,0 +1,30 @@
+{
+  "name": "legacyvault-monorepo",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "db",
+    "sdk",
+    "api",
+    "indexer",
+    "notifier",
+    "web"
+  ],
+  "scripts": {
+    "db:generate": "pnpm -C db prisma generate",
+    "db:migrate": "pnpm -C db prisma migrate dev",
+    "dev:api": "pnpm -C api dev",
+    "dev:indexer": "pnpm -C indexer dev",
+    "dev:notifier": "pnpm -C notifier dev",
+    "dev:web": "pnpm -C web dev",
+    "dev": "pnpm -r --parallel dev"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.1.3"
+  }
+}

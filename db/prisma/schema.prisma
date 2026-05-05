@@ -1,0 +1,235 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  wallet    String   @unique
+  createdAt DateTime @default(now())
+  sessions  Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  jti       String   @unique
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+}
+
+model Vault {
+  id              String   @id @default(cuid())
+  vaultPubkey     String   @unique
+  ownerWallet     String
+  vaultIdU64      String?  // stored as string for safety
+  status          String
+
+  lastCheckinUnix        BigInt?
+  heartbeatIntervalSecs  Int?
+  inactivityThresholdSecs Int?
+  timelockSecs           Int?
+  guardianThreshold      Int?
+  panicEnabled           Boolean?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  guardians       Guardian[]
+  beneficiaries   Beneficiary[]
+  unlockSessions  UnlockSession[]
+  subscriptions   Subscription[]
+  documents       Document[]
+  assetRules      AssetRule[]
+}
+
+model Guardian {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  guardian    String
+  role        String
+  active      Boolean  @default(true)
+  addedAt     DateTime @default(now())
+
+  @@unique([vaultId, guardian])
+}
+
+model Beneficiary {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  beneficiary String
+  shareBps    Int
+  label       String?
+  active      Boolean  @default(true)
+  addedAt     DateTime @default(now())
+
+  @@unique([vaultId, beneficiary])
+}
+
+model UnlockSession {
+  id              String   @id @default(cuid())
+  unlockPubkey     String   @unique
+  vaultId          String
+  vault            Vault    @relation(fields: [vaultId], references: [id])
+
+  nonceU64         String
+  status           String
+  initiatedBy      String
+  initiatedAtUnix  BigInt
+  approvals        Int
+  threshold        Int
+  approvedAtUnix   BigInt?
+  executableAtUnix BigInt?
+
+  approvalsRows    Approval[]
+  distSol          DistributionSolSession?
+  distSpl          DistributionSplSession[]
+  dispute          DisputeCase?
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Approval {
+  id             String   @id @default(cuid())
+  unlockId        String
+  unlock          UnlockSession @relation(fields: [unlockId], references: [id])
+  guardian        String
+  approvedAtUnix  BigInt
+
+  @@unique([unlockId, guardian])
+}
+
+model DistributionSolSession {
+  id                String   @id @default(cuid())
+  unlockId           String   @unique
+  unlock             UnlockSession @relation(fields: [unlockId], references: [id])
+
+  totalDistributable BigInt
+  paidTotal          BigInt
+  cursor             Int
+  done               Boolean
+
+  updatedAt          DateTime @updatedAt
+}
+
+model DistributionSplSession {
+  id           String   @id @default(cuid())
+  unlockId      String
+  unlock        UnlockSession @relation(fields: [unlockId], references: [id])
+
+  mint         String
+  totalBalance BigInt
+  paidTotal    BigInt
+  cursor       Int
+  done         Boolean
+
+  @@unique([unlockId, mint])
+}
+
+model DisputeCase {
+  id            String   @id @default(cuid())
+  unlockId       String   @unique
+  unlock         UnlockSession @relation(fields: [unlockId], references: [id])
+
+  status        String
+  openedBy      String
+  openedAtUnix  BigInt
+  noteHashHex   String
+
+  resolvedAt    DateTime?
+}
+
+model Subscription {
+  id            String   @id @default(cuid())
+  vaultId       String
+  vault         Vault    @relation(fields: [vaultId], references: [id])
+  planId        Int
+  validUntilUnix BigInt
+  updatedAt     DateTime @updatedAt
+
+  @@unique([vaultId, planId])
+}
+
+model GuardianProfile {
+  id           String   @id @default(cuid())
+  guardian     String   @unique
+  displayName  String?
+  websiteUri   String?
+  kycLevel     Int      @default(0)
+  active       Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
+}
+
+model GuardianBond {
+  id        String   @id @default(cuid())
+  guardian  String   @unique
+  amount    BigInt
+  locked    Boolean
+  updatedAt DateTime @updatedAt
+}
+
+model EventLog {
+  id         String   @id @default(cuid())
+  signature  String   @unique
+  slot       BigInt
+  programId  String
+  eventName  String
+  dataJson   Json
+  blockTime  BigInt?
+  createdAt  DateTime @default(now())
+}
+
+model IndexerCursor {
+  id        String   @id
+  lastSlot  BigInt   @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+model ProcessedTx {
+  signature   String   @id
+  slot        BigInt
+  processedAt DateTime @default(now())
+}
+
+model Document {
+  id          String   @id @default(cuid())
+  vaultId     String
+  vault       Vault    @relation(fields: [vaultId], references: [id])
+  docHashHex  String
+  uri         String?
+  uriLen      Int
+  tsUnix      BigInt
+  createdAt   DateTime @default(now())
+  @@unique([vaultId, docHashHex])
+}
+
+model AssetRule {
+  id                  String   @id @default(cuid())
+  vaultId             String
+  vault               Vault    @relation(fields: [vaultId], references: [id])
+  mint                String
+  mode                String
+  assignedBeneficiary String
+  tsUnix              BigInt
+  updatedAt           DateTime @updatedAt
+  @@unique([vaultId, mint])
+}
+
+model GlobalConfig {
+  id                 String   @id @default("singleton")
+  admin              String
+  arbiter            String
+  treasury           String
+  createFeeLamports  BigInt
+  paused             Boolean  @default(false)
+  version            Int      @default(1)
+  updatedAt          DateTime @updatedAt
+}
